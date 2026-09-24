@@ -11,7 +11,7 @@ independent abstract ``collections.deque``.
 
 from collections import deque
 
-from afifo import AsyncFIFO, Event
+from afifo import AsyncFIFO, Event, binary_to_gray
 from afifo.model import AsyncFIFOError
 
 
@@ -237,9 +237,132 @@ def section_boundary():
     print("[批次原子性] 失败后寄存器与轨迹与批次前完全一致，无部分变更")
 
 
+def section_reset():
+    print("\n" + "=" * 106)
+    print("读写域独立复位 + 世代双向确认（k=2 深度4）：满队列 -> 写域复位 -> 握手 -> 再次复位")
+    print("=" * 106)
+    fifo = AsyncFIFO(k=2)
+
+    def step(t, wc, rc, we=False, re_=False, d=None, wrs=False, rrs=False):
+        return fifo.run_one(Event(t, bool(wc), bool(rc), bool(we), bool(re_),
+                                  d, wrst=bool(wrs), rrst=bool(rrs)))
+
+    print("-- 写满 4 个数据，full 置位 --")
+    for i, t in enumerate((1, 2, 3, 4), start=0):
+        r = step(t, 1, 0, we=True, d=f"P{i}")
+        print(f"t={t} 写接受={int(r.w_accept)} wptr={r.wptr_after} "
+              f"full={int(r.full_after)} wgen={r.wgen_after}")
+    assert fifo.full
+    overflow = step(5, 1, 0, we=True, d="P4")
+    print(f"t=5 满队列再写：w_accept={overflow.w_accept}（P4 永不入存储器）")
+    assert overflow.w_accept is False
+
+    print("\n-- t=6 写域复位脉冲（同刻 wen 仍无效）；读域时钟暂停 3 拍 --")
+    r = step(6, 1, 0, we=True, d="P4", wrs=True)
+    print(f"t=6 复位: wptr {r.wptr_before}->{r.wptr_after} full "
+          f"{int(r.full_before)}->{int(r.full_after)} wgen "
+          f"{r.wgen_before}->{r.wgen_after} 门(写ready,读ready)="
+          f"({int(r.wready_after)},{int(r.rready_after)}) 写接受="
+          f"{int(r.w_accept)}")
+    assert r.wptr_after == 0 and r.wgen_after == 1 and r.w_accept is False
+    assert fifo.accepted_writes == 0
+    for t in (7, 8):
+        r = step(t, 1, 0, we=True, d="P5")
+        print(f"t={t} 读域尚未确认世代：写接受={int(r.w_accept)} "
+              f"门=({int(r.wready_after)},{int(r.rready_after)})")
+        assert r.w_accept is False
+
+    print("\n-- 读域时钟恢复：两级同步后响应式复位，再把世代回声传回 --")
+    r = step(9, 0, 1, re_=True)
+    print(f"t=9 读沿: wgen2r={r.wgen2r_after} rgen={r.rgen_after} "
+          f"读接受={int(bool(r.r_accept))}")
+    assert r.rgen_after == 0 and r.r_accept is False
+    r = step(10, 0, 1, re_=True)
+    print(f"t=10 读沿: 响应式复位 rgen 0->{r.rgen_after} rptr="
+          f"{r.rptr_after} empty={int(r.empty_after)} 门="
+          f"({int(r.wready_after)},{int(r.rready_after)})")
+    assert r.rgen_after == 1 and r.rptr_after == 0 and r.rready_after
+    r = step(11, 1, 0, we=True, d="P5")
+    print(f"t=11 写沿: rgen2w={r.rgen2w_after} 门="
+          f"({int(r.wready_after)},{int(r.rready_after)}) 写接受="
+          f"{int(r.w_accept)}")
+    assert not fifo.synchronized and r.w_accept is False
+    r = step(12, 1, 0, we=True, d="P5")
+    print(f"t=12 写沿: 回声到二级，门=({int(r.wready_after)},"
+          f"{int(r.rready_after)})；门在沿末才开，本拍仍拒绝")
+    assert fifo.synchronized and r.w_accept is False
+    r = step(13, 1, 0, we=True, d="P5")
+    print(f"t=13 门已开：写接受={int(r.w_accept)} wptr={r.wptr_after}")
+    assert r.w_accept is True
+
+    print("\n-- 再次复位：握手未完成时连发第二个写复位脉冲，旧确认不得误开 --")
+    r = step(14, 1, 0, wrs=True)
+    print(f"t=14 写复位 wgen 1->{r.wgen_after}，门="
+          f"({int(r.wready_after)},{int(r.rready_after)})")
+    assert r.wgen_after == 2
+    r = step(15, 1, 0, wrs=True)
+    print(f"t=15 再次写复位 wgen 2->{r.wgen_after}（在途的世代1回声作废）")
+    assert r.wgen_after == 3
+    r = step(16, 0, 1)
+    print(f"t=16 读沿 s1 见到世代3格雷={binary_to_gray(3)}，"
+          f"rgen 仍={r.rgen_after}，门=({int(r.wready_after)},"
+          f"{int(r.rready_after)})")
+    assert r.rgen_after == 1
+    r = step(17, 0, 1)
+    print(f"t=17 读沿采用最新世代 rgen->{r.rgen_after}（跨过世代2）")
+    assert r.rgen_after == 3
+    step(18, 1, 0)
+    r = step(19, 1, 0)
+    print(f"t=19 回声完成：门=({int(r.wready_after)},{int(r.rready_after)})")
+    assert fifo.synchronized
+
+    print("\n-- 复位后写入新数据并读回：复位前的 P0..P5 全部不可见 --")
+    r = step(20, 1, 0, we=True, d="Q1")
+    assert r.w_accept
+    got = []
+    t = 20
+    while len(got) < 1 and t < 26:
+        t += 1
+        rr = step(t, 0, 1, re_=True)
+        if rr.r_accept:
+            got.append(rr.rdata)
+    print(f"排空得到 = {got}；接受写={fifo.accepted_writes} "
+          f"接受读={fifo.accepted_reads}（均为本次复位后的计数）")
+    assert got == ["Q1"]
+    assert fifo.accepted_writes == 1 and fifo.accepted_reads == 1
+
+    print("\n-- 实际错误：复位脉冲不伴随本域时钟沿 --")
+    for desc, ctor in [
+        ("wrst=True 但 wclk=False",
+         lambda: Event(27, False, True, wrst=True)),
+        ("rrst=True 但 rclk=False",
+         lambda: Event(27, True, False, rrst=True)),
+        ("wrst=1 非布尔",
+         lambda: Event(27, True, False, wrst=1)),
+    ]:
+        try:
+            ctor()
+        except AsyncFIFOError as exc:
+            print(f"[契约异常] {desc} -> AsyncFIFOError: {exc}")
+        else:
+            raise AssertionError(f"{desc} 应当抛出 AsyncFIFOError")
+
+    # failed reset batch leaves no partial change
+    before, before_n = fifo.snapshot(), len(fifo.steps)
+    try:
+        fifo.run([Event(28, True, False, wrst=True),
+                  Event(29, True, False, wen=True, wdata="x"),
+                  Event(29, True, False)])
+    except AsyncFIFOError as exc:
+        print(f"[批次原子性] 含复位的非法批次被拒：{exc}")
+    assert fifo.snapshot() == before and len(fifo.steps) == before_n
+    print("[批次原子性] 复位批次失败后寄存器、世代、轨迹均无部分变更")
+
+
 def main():
     section_normal()
     section_wrap()
+    section_reset()
     section_boundary()
     print("\n演示完成：以上数值均由模型实时计算；抽象队列独立核对全部通过。")
 
