@@ -237,9 +237,113 @@ def section_boundary():
     print("[批次原子性] 失败后寄存器与轨迹与批次前完全一致，无部分变更")
 
 
+def section_reset():
+    print("\n" + "=" * 106)
+    print("读写域单独复位 + 世代双向确认：k=2，深度4。先填满，再做写域异步复位，逐拍展示世代/应答两级同步")
+    print("=" * 106)
+    fifo = AsyncFIFO(k=2)
+    t = 0
+    for d in ("A", "B", "C", "D"):
+        t += 1
+        fifo.run_one(Event(t, True, False, wen=True, wdata=d))
+    print(f"填满 {fifo.depth} 个：full={int(full := fifo.full)} "
+          f"wptr={fifo.wptr} 世代 w/r={fifo.w_generation}/{fifo.r_generation}")
+    assert full and fifo.accepted_writes == 4
+
+    # asynchronous write-domain reset (no clock edge required)
+    t += 1
+    rr = fifo.run_one(Event(t, False, False, wrst=True))
+    print(f"t={t} wrst 异步复位（双时钟均停，合法）：世代 {rr.wgen_before}->"
+          f"{rr.wgen_after}，wptr {rr.wptr_before}->{rr.wptr_after}，"
+          f"full={int(rr.full_after)}，synced={int(rr.synced_before)}->"
+          f"{int(rr.synced_after)}；存储器与计数已清空"
+          f"（接受写/读={fifo.accepted_writes}/{fifo.accepted_reads}）")
+    assert rr.wgen_after == 1 and rr.wptr_after == 0
+    assert fifo.accepted_writes == 0 and fifo.accepted_reads == 0
+
+    print("\n世代 1 经读域两级同步器传播（确认前每一步读写都被拒绝）：")
+    rows = []
+    # two read edges: generation reaches s1 then s2
+    for label in ("读沿1: wgen2r s1 锁存新世代",
+                  "读沿2: s2 见到新世代",
+                  "读沿3: 读域学到世代1->rack_reg，应答出发"):
+        t += 1
+        r = fifo.run_one(Event(t, False, True, ren=True))
+        rows.append((t, r))
+        print(f"  t={t} {label}：wgen2r={r.wgen2r_after} "
+              f"rack_reg={r.rack_reg_after} r接受={r.r_accept} "
+              f"synced={int(r.synced_after)}")
+    assert rows[2][1].rack_reg_after == 1
+    assert all(r.r_accept is False for _, r in rows)
+    # two write edges: acknowledgement returns
+    ack_rows = []
+    for label in ("写沿1: 应答到 s1", "写沿2: 应答到 s2，双向确认完成"):
+        t += 1
+        r = fifo.run_one(Event(t, True, False, wen=True, wdata="LATE"))
+        ack_rows.append((t, r))
+        print(f"  t={t} {label}：rack2w={r.rack2w_after} "
+              f"写接受={r.w_accept} synced={int(r.synced_after)}")
+    assert ack_rows[1][1].synced_after
+    assert all(r.w_accept is False for _, r in ack_rows)
+
+    # FIFO is logically empty; the LATE write was refused, offer it again
+    t += 1
+    empty_read = fifo.run_one(Event(t, False, True, ren=True))
+    print(f"\nt={t} 同步恢复后的首个读请求：r_accept={empty_read.r_accept}"
+          "（复位清空旧数据，FIFO 真空）")
+    assert empty_read.r_accept is False
+    t += 1
+    w = fifo.run_one(Event(t, True, False, wen=True, wdata="E1"))
+    assert w.w_accept
+    reads = []
+    for _ in range(4):  # s1, s2, empty deasserts at edge end, accept next
+        t += 1
+        reads.append(fifo.run_one(Event(t, False, True, ren=True)))
+    got = reads[-1]
+    print(f"t={t} 重新写入 E1 后经 4 个读沿（两级同步+判旗标+接受）读出："
+          f"r_accept={got.r_accept} rdata={got.rdata!r}（绝无 A..D 旧数据）")
+    assert [r.r_accept for r in reads] == [False, False, False, True]
+    assert got.rdata == "E1"
+
+    # ---- second reset while a handshake is already pending (re-reset)
+    print("\n再次复位（上一轮握手中途再次 wrst，世代号单调递增）：")
+    t += 1
+    fifo.run_one(Event(t, False, False, wrst=True))      # generation 2
+    t += 1
+    mid = fifo.run_one(Event(t, False, True))            # only s1 of gen 2
+    print(f"  t={t} 世代={fifo.w_generation}，仅过一个读沿 wgen2r={mid.wgen2r_after}，"
+          "管道里还残留世代1的应答")
+    assert fifo.w_generation == 2 and not fifo.synced
+    guard = 0
+    while not fifo.synced:
+        t += 1
+        fifo.run_one(Event(t, True, True))
+        guard += 1
+        assert guard < 20
+    snap = fifo.snapshot()
+    print(f"  再经 {guard} 个同刻边沿后 synced=1；收敛于最新世代：rack2w={snap['rack2w']}，"
+          f"rack_reg={snap['rack_reg']}，旧世代1的在途值已自然老化")
+    assert snap["rack2w"][1] == 2 and snap["rack_reg"] == 2
+
+    # ---- actual contract errors around reset
+    print("\n复位相关的真实契约异常（就地捕获）：")
+    for desc, make in [
+        ("wrst=1 非布尔", lambda: Event(1, False, False, wrst=1)),
+        ("rrst=0.0 非布尔", lambda: Event(1, False, False, rrst=0.0)),
+        ("双停且无复位", lambda: Event(1, False, False)),
+    ]:
+        try:
+            make()
+        except AsyncFIFOError as exc:
+            print(f"  [契约异常] {desc} -> AsyncFIFOError: {exc}")
+        else:
+            raise AssertionError(f"{desc} 应当抛出 AsyncFIFOError")
+
+
 def main():
     section_normal()
     section_wrap()
+    section_reset()
     section_boundary()
     print("\n演示完成：以上数值均由模型实时计算；抽象队列独立核对全部通过。")
 
