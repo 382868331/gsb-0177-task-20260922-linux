@@ -11,7 +11,7 @@ independent abstract ``collections.deque``.
 
 from collections import deque
 
-from afifo import AsyncFIFO, Event
+from afifo import AsyncFIFO, Event, ReadyValidFIFO, RVEvent
 from afifo.model import AsyncFIFOError
 
 
@@ -237,9 +237,112 @@ def section_boundary():
     print("[批次原子性] 失败后寄存器与轨迹与批次前完全一致，无部分变更")
 
 
+# Fixed ready/valid schedule for k=1 (depth 2).  Literal values, no randomness.
+# (time, wclk, rclk, wen, ready, wdata)
+RV_SCHEDULE = [
+    (1, 1, 0, 1, 0, "a"),     # 写 a
+    (2, 1, 0, 1, 0, "b"),     # 写 b，本沿末 full 置位
+    (3, 1, 0, 1, 0, "c"),     # full=1：c 被拒绝
+    (4, 0, 1, 0, 0, None),    # 数据已写入但未跨域：预取请求被旧 empty 拒绝
+    (5, 0, 1, 0, 0, None),    # 同上（同步器第2级）
+    (6, 0, 1, 0, 0, None),    # 同上，本拍末 empty 撤销
+    (7, 0, 1, 0, 0, None),    # 预取 a 装入输出寄存器，valid 置位
+    (8, 0, 1, 0, 0, None),    # ready=0 背压：输出稳定，读指针不动
+    (9, 0, 1, 0, 0, None),    # 持续背压
+    (10, 0, 1, 0, 1, None),   # ready=1：同拍交付 a 并装入 b，valid 保持
+    (11, 0, 1, 0, 1, None),   # 交付 b，内层已空无可装，valid 落下
+    (12, 1, 0, 1, 0, "d"),    # 读指针尚未同步回写域：d 仍被旧 full 拒绝
+    (13, 1, 0, 1, 0, "d"),    # 同上
+    (14, 1, 0, 1, 0, "d"),    # 拒绝，但本拍末 full 撤销
+    (15, 1, 0, 1, 0, "d"),    # 写 d 接受
+    (16, 1, 0, 1, 0, "e"),    # 写 e 接受，写指针 3->0 回绕
+    (17, 0, 1, 0, 1, None),   # 新写未跨域：不能凭真实队列长度预取
+    (18, 0, 1, 0, 1, None),
+    (19, 0, 1, 0, 1, None),
+    (20, 0, 1, 0, 1, None),   # 预取 d 装入输出寄存器
+    (21, 0, 1, 0, 1, None),   # 同拍交付 d 并装入 e；读指针 3->0 回绕
+    (22, 0, 1, 0, 1, None),   # 交付 e，valid 落下
+]
+
+
+def section_ready_valid():
+    print("\n" + "=" * 106)
+    print("ready/valid 输出寄存器：k=1，内层深度 2（depth 参数不含输出寄存器），固定字面值调度")
+    print("=" * 106)
+    fifo = ReadyValidFIFO(k=1)
+    print(f"复位态: valid={int(fifo.valid)} empty={int(fifo.empty)} "
+          f"full={int(fifo.full)} depth={fifo.depth}\n")
+    records = fifo.run(RVEvent(t, bool(w), bool(r), bool(we), bool(rd), d)
+                       for (t, w, r, we, rd, d) in RV_SCHEDULE)
+
+    print("t    边  en=wen/rdy ren | 内层W/R | load deliver | valid out "
+          "| wptr rptr F E")
+    for rec in records:
+        edge = ("W" if rec.wclk else ".") + ("R" if rec.rclk else ".")
+        ren = {True: "1", False: "0", None: "-"}[rec.ren]
+        wa = {True: "A", False: "x", None: "-"}[rec.w_accept]
+        ra = {True: "A", False: "x", None: "-"}[rec.r_accept]
+        load = {True: "1", False: "0", None: "-"}[rec.load]
+        dlv = {True: "1", False: "0", None: "-"}[rec.delivered]
+        out = rec.out_after if rec.valid_after else ""
+        print(f"t={rec.time:>2} {edge}  en={int(rec.wen)}{int(rec.ready)}"
+              f"      ren={ren} | W:{wa} R:{ra}  | load={load} dlv={dlv}"
+              f"  | v={int(rec.valid_after)} out={out!s:<4}"
+              f"| wptr={rec.inner.wptr_after:02b} rptr={rec.inner.rptr_after:02b}"
+              f" F={int(rec.inner.full_after)} E={int(rec.inner.empty_after)}")
+
+    # 独立核对：被接受写入序列 vs 下游交付序列（两条序列分开维护）
+    written = [r.wdata for r in records if r.w_accept]
+    delivered_seq = [r.delivered_data for r in records if r.delivered]
+    print("\n独立序列核对（接受写入 / 下游交付分开维护）：")
+    print(f"  接受写入 = {written}")
+    print(f"  下游交付 = {delivered_seq}")
+    assert written == ["a", "b", "d", "e"]            # c 被 full 拒绝
+    assert delivered_seq == written                    # 交付是写入的同序前缀
+    assert fifo.accepted_writes == 4
+    assert fifo.accepted_reads == 4                    # 内层出队=装入次数
+    assert fifo.delivered == 4                         # 只计 旧valid&ready
+
+    # 背压稳定性锚点：t=8/9 输出字与读指针冻结
+    for rec in records:
+        if rec.time in (8, 9):
+            assert rec.ren is False and rec.out_after == "a"
+            assert rec.inner.rptr_after == 1 and rec.valid_after
+    print("  t=8..9 背压：ren=0，out='a' 与 rptr 均冻结，valid 保持")
+
+    # 同拍消费+装入锚点
+    rec10 = records[9]
+    assert rec10.delivered and rec10.delivered_data == "a"
+    assert rec10.load and rec10.out_after == "b" and rec10.valid_after
+    print("  t=10 同拍：交付旧值 'a' 并装入新值 'b'，valid 保持为 1")
+
+    # 容量口径：预取使“内层占用”与“下游在途”出现差异
+    print("\n容量口径（预取导致的统计差异，输出寄存器不占 depth）：")
+    print(f"  depth 参数 = {fifo.depth}（仅内层）；在途上限 = depth+1 = "
+          f"{fifo.depth + 1}")
+    print("  恒等式：在途 = 接受写 - 交付 = 内层占用(接受写-内层出队) + valid")
+    print(f"  当前：{fifo.inflight} = {fifo.accepted_writes}-"
+          f"{fifo.delivered} = "
+          f"({fifo.accepted_writes}-{fifo.accepted_reads}) + "
+          f"{int(fifo.valid)}")
+
+    # 输出寄存器满（valid=1）时复位
+    fifo.reset()
+    fifo.run_one(RVEvent(1, True, False, wen=True, wdata="z"))
+    for t in (2, 3, 4, 5):
+        fifo.run_one(RVEvent(t, False, True, ready=False))
+    assert fifo.valid and fifo.out_data == "z"
+    fifo.reset()
+    assert not fifo.valid and fifo.out_data is None and fifo.empty
+    print("\n复位：输出寄存器满（valid=1, out='z'）时复位 -> "
+          f"valid={int(fifo.valid)}，内层 empty={int(fifo.empty)}，"
+          "计数与轨迹清零")
+
+
 def main():
     section_normal()
     section_wrap()
+    section_ready_valid()
     section_boundary()
     print("\n演示完成：以上数值均由模型实时计算；抽象队列独立核对全部通过。")
 
