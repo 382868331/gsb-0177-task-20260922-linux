@@ -22,14 +22,39 @@ Timing model (one :class:`Event` = one point on an integer time axis)
   accepted iff ``rclk and ren and not empty_old``.  Acceptance never consults
   a global queue length -- the data array is addressed memory, not a flag.
 
+Almost-full / almost-empty hints (hysteresis)
+---------------------------------------------
+
+Two extra *advisory* flags let upstream logic throttle before the hard
+``full``/``empty`` flags fire:
+
+* ``almost_full`` is a write-domain register (reset ``False``).  On a write
+  edge the domain estimates occupancy as
+  ``(wptr_next - gray_to_binary(r2w_s2_old)) mod 2**(k+1)`` -- the local
+  post-accept pointer minus the OLD stage-2 synchronized read pointer.  The
+  flag sets when the estimate reaches ``almost_full_high`` and clears only
+  when it falls to ``almost_full_low`` or below (``low < high`` required).
+* ``almost_empty`` is a read-domain register (reset ``True``).  On a read
+  edge the domain estimates readable data as
+  ``(gray_to_binary(w2r_s2_old) - rptr_next) mod 2**(k+1)``.  The flag sets
+  when the estimate falls to ``almost_empty_low`` or below and clears only
+  when it rises to ``almost_empty_high`` or above (``low < high`` required).
+
+Because each estimate uses a stale synchronized peer pointer, the write
+domain may overestimate occupancy and the read domain may underestimate
+readable data -- the intended conservative behaviour.  The estimates are
+derived from pointers and synchronizer registers only, never from the data
+memory or any queue length.  Both flags are hints: accept/reject decisions
+remain governed solely by ``full``/``empty``.
+
 Disabling a clock (``wclk=False`` / ``rclk=False``) freezes every register in
-that domain, synchronizers included.
+that domain, synchronizers and the almost-* flag included.
 """
 
 import math
 from typing import Any, NamedTuple, Optional
 
-from .gray import binary_to_gray
+from .gray import binary_to_gray, gray_to_binary
 
 __all__ = ["AsyncFIFO", "AsyncFIFOError", "Event", "EdgeRecord"]
 
@@ -143,6 +168,12 @@ class EdgeRecord(NamedTuple):
     values are the registers sampled at the edge (old state); ``*_after``
     values are the register contents after the edge.  ``w_accept`` /
     ``r_accept`` are ``None`` when the corresponding domain did not clock.
+
+    ``w_used_est`` / ``r_avail_est`` are the per-domain occupancy estimates
+    (mod ``2**(k+1)`` pointer distance to the OLD stage-2 synchronized peer
+    pointer) computed on that domain's edge, or ``None`` when the domain did
+    not clock.  ``almost_full_*`` / ``almost_empty_*`` are the hysteresis
+    hint registers; a stopped domain keeps its previous value.
     """
 
     time: int
@@ -170,6 +201,14 @@ class EdgeRecord(NamedTuple):
     w2r_after: tuple
     wdata: Any
     rdata: Any
+    # --- advisory almost-* interface (appended; old positional fields keep
+    # --- their indices so existing unpacking of the leading fields works)
+    w_used_est: Optional[int]
+    r_avail_est: Optional[int]
+    almost_full_before: bool
+    almost_full_after: bool
+    almost_empty_before: bool
+    almost_empty_after: bool
 
 
 class AsyncFIFO:
@@ -177,13 +216,27 @@ class AsyncFIFO:
 
     Parameters
         k: log2 depth; ``k in {1, 2, 3, 4, 5}`` (depth 2..32).
+        almost_full_low / almost_full_high: hysteresis thresholds for the
+            write-domain ``almost_full`` hint, integers in ``[0, depth]``
+            with ``low < high``.  Defaults: ``depth - 1`` / ``depth``.
+        almost_empty_low / almost_empty_high: hysteresis thresholds for the
+            read-domain ``almost_empty`` hint, integers in ``[0, depth]``
+            with ``low < high``.  Defaults: ``0`` / ``1``.
 
     Usage
         >>> fifo = AsyncFIFO(k=3)
         >>> records = fifo.run([Event(0, True, False, wen=True, wdata=10)])
     """
 
-    def __init__(self, k: int) -> None:
+    def __init__(
+        self,
+        k: int,
+        *,
+        almost_full_low: Optional[int] = None,
+        almost_full_high: Optional[int] = None,
+        almost_empty_low: Optional[int] = None,
+        almost_empty_high: Optional[int] = None,
+    ) -> None:
         self._k = _strict_int(k, "k", lo=1, hi=5)
         self._depth = 1 << k
         self._width = k + 1
@@ -191,6 +244,29 @@ class AsyncFIFO:
         self._addr_mask = self._depth - 1
         # Flip the top two pointer bits to test the full condition.
         self._full_mask = 0b11 << (k - 1)
+        d = self._depth
+        self._af_low = _strict_int(
+            d - 1 if almost_full_low is None else almost_full_low,
+            "almost_full_low", lo=0, hi=d)
+        self._af_high = _strict_int(
+            d if almost_full_high is None else almost_full_high,
+            "almost_full_high", lo=0, hi=d)
+        self._ae_low = _strict_int(
+            0 if almost_empty_low is None else almost_empty_low,
+            "almost_empty_low", lo=0, hi=d)
+        self._ae_high = _strict_int(
+            1 if almost_empty_high is None else almost_empty_high,
+            "almost_empty_high", lo=0, hi=d)
+        if not self._af_low < self._af_high:
+            raise AsyncFIFOError(
+                f"'almost_full_low' must be strictly less than "
+                f"'almost_full_high'; got {self._af_low} >= {self._af_high}"
+            )
+        if not self._ae_low < self._ae_high:
+            raise AsyncFIFOError(
+                f"'almost_empty_low' must be strictly less than "
+                f"'almost_empty_high'; got {self._ae_low} >= {self._ae_high}"
+            )
         self.reset()
 
     def reset(self) -> None:
@@ -199,6 +275,8 @@ class AsyncFIFO:
         self._rptr = 0
         self._full = False
         self._empty = True
+        self._almost_full = False   # write-domain hint, resets deasserted
+        self._almost_empty = True   # read-domain hint, resets asserted
         self._r2w_s1 = 0  # synchronized read Gray, stage 1 (write domain)
         self._r2w_s2 = 0  # synchronized read Gray, stage 2 (write domain)
         self._w2r_s1 = 0  # synchronized write Gray, stage 1 (read domain)
@@ -227,6 +305,32 @@ class AsyncFIFO:
     def empty(self) -> bool:
         """Current read-domain empty flag (register output)."""
         return self._empty
+
+    @property
+    def almost_full(self) -> bool:
+        """Current write-domain almost-full hint (register output)."""
+        return self._almost_full
+
+    @property
+    def almost_empty(self) -> bool:
+        """Current read-domain almost-empty hint (register output)."""
+        return self._almost_empty
+
+    @property
+    def almost_full_low(self) -> int:
+        return self._af_low
+
+    @property
+    def almost_full_high(self) -> int:
+        return self._af_high
+
+    @property
+    def almost_empty_low(self) -> int:
+        return self._ae_low
+
+    @property
+    def almost_empty_high(self) -> int:
+        return self._ae_high
 
     @property
     def wptr(self) -> int:
@@ -258,6 +362,8 @@ class AsyncFIFO:
             "rgray": binary_to_gray(self._rptr),
             "full": self._full,
             "empty": self._empty,
+            "almost_full": self._almost_full,
+            "almost_empty": self._almost_empty,
             "r2w": (self._r2w_s1, self._r2w_s2),
             "w2r": (self._w2r_s1, self._w2r_s2),
             "last_time": self._last_time,
@@ -320,6 +426,7 @@ class AsyncFIFO:
         # ---- old state, sampled by both edges at this (possibly common) time
         wptr_o, rptr_o = self._wptr, self._rptr
         full_o, empty_o = self._full, self._empty
+        af_o, ae_o = self._almost_full, self._almost_empty
         r2w_s1_o, r2w_s2_o = self._r2w_s1, self._r2w_s2
         w2r_s1_o, w2r_s2_o = self._w2r_s1, self._w2r_s2
         wgray_o = binary_to_gray(wptr_o)
@@ -351,6 +458,26 @@ class AsyncFIFO:
         if event.rclk:
             empty_n = rgray_n == w2r_s2_o
 
+        # ---- advisory almost-* flags with hysteresis.  Each estimate is the
+        # ---- mod-2**(k+1) distance from the local post-accept pointer to
+        # ---- the OLD stage-2 synchronized peer pointer (never the memory).
+        w_used_est = None
+        af_n = af_o
+        if event.wclk:
+            w_used_est = (wptr_n - gray_to_binary(r2w_s2_o)) & self._mask
+            if w_used_est >= self._af_high:
+                af_n = True
+            elif w_used_est <= self._af_low:
+                af_n = False
+        r_avail_est = None
+        ae_n = ae_o
+        if event.rclk:
+            r_avail_est = (gray_to_binary(w2r_s2_o) - rptr_n) & self._mask
+            if r_avail_est <= self._ae_low:
+                ae_n = True
+            elif r_avail_est >= self._ae_high:
+                ae_n = False
+
         # ---- two-stage synchronizers; input stage samples the OLD Gray
         if event.wclk:
             r2w_s1_n, r2w_s2_n = rgray_o, r2w_s1_o
@@ -364,6 +491,7 @@ class AsyncFIFO:
         # ---- commit
         self._wptr, self._rptr = wptr_n, rptr_n
         self._full, self._empty = full_n, empty_n
+        self._almost_full, self._almost_empty = af_n, ae_n
         self._r2w_s1, self._r2w_s2 = r2w_s1_n, r2w_s2_n
         self._w2r_s1, self._w2r_s2 = w2r_s1_n, w2r_s2_n
         self._last_time = event.time
@@ -394,6 +522,12 @@ class AsyncFIFO:
             w2r_after=(w2r_s1_n, w2r_s2_n),
             wdata=event.wdata,
             rdata=rdata,
+            w_used_est=w_used_est,
+            r_avail_est=r_avail_est,
+            almost_full_before=af_o,
+            almost_full_after=af_n,
+            almost_empty_before=ae_o,
+            almost_empty_after=ae_n,
         )
         self._steps.append(record)
         return record
