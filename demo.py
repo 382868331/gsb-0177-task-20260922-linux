@@ -237,9 +237,83 @@ def section_boundary():
     print("[批次原子性] 失败后寄存器与轨迹与批次前完全一致，无部分变更")
 
 
+def section_almost():
+    print("\n" + "=" * 106)
+    print("almost_full / almost_empty（带迟滞的提前提示）：k=2 深度4，两组阈值均 (low=1, high=3)，")
+    print("迟滞带=估计值 2。估计=本沿接受后的本地指针 − 边沿前二级同步对端格雷(反解)，模 8；不读队列长度。")
+    print("w_occ 可能偏大、r_rd 可能偏小，是刻意保留的保守偏差。两标志仅提示，不参与 full/empty 接受判定。")
+    print("=" * 106)
+
+    # Fixed literal schedule: fill to full, let the read domain crawl through
+    # its two sync stages, drain, then let the write domain catch up.
+    schedule = [
+        (1, 1, 0, 1, 0), (2, 1, 0, 1, 0), (3, 1, 0, 1, 0), (4, 1, 0, 1, 0),
+        (5, 0, 1, 0, 1), (6, 1, 0, 0, 0), (7, 0, 1, 0, 1), (8, 1, 0, 0, 0),
+        (9, 0, 1, 0, 1), (10, 0, 1, 0, 1), (11, 0, 1, 0, 1),
+        (12, 1, 0, 0, 0), (13, 1, 0, 0, 0), (14, 0, 1, 0, 1),
+        (15, 1, 0, 0, 0), (16, 1, 0, 0, 0), (17, 1, 0, 0, 0),
+    ]
+    fifo = AsyncFIFO(k=2, almost_full_low=1, almost_full_high=3,
+                     almost_empty_low=1, almost_empty_high=3)
+    print(f"复位态: almost_full={int(fifo.almost_full)} "
+          f"almost_empty={int(fifo.almost_empty)} （AF 复位为假、AE 复位为真）\n")
+    print("t    边  接受  | 写域估计   读域估计 | AF(置>=3 清<=1) "
+          "AE(置<=1 清>=3) | 说明")
+    rows = fifo.run([Event(t, bool(w), bool(r), bool(we), bool(re_))
+                     for (t, w, r, we, re_) in schedule])
+    for i, rec in enumerate(rows):
+        edge = ("W" if rec.wclk else ".") + ("R" if rec.rclk else ".")
+        accw = {True: "A", False: "x", None: "-"}[rec.w_accept]
+        accr = {True: "A", False: "x", None: "-"}[rec.r_accept]
+        wocc = "-" if rec.w_occ_after is None else str(rec.w_occ_after)
+        rrd = "-" if rec.r_readable_after is None else str(rec.r_readable_after)
+        note = ""
+        if rec.time == 3:
+            note = "w_occ 到 high=3：AF 置位（此时尚未真正满）"
+        elif rec.time == 9:
+            note = "r_rd 升到 high=3 以上：AE 清除（两级同步后才看见写）"
+        elif rec.time == 14:
+            note = "r_rd 降到 low=1：AE 重新置位（仍有数据可读，纯提示）"
+        elif rec.time in (15, 16):
+            note = "w_occ=2 落在迟滞带：AF 保持，不抖动"
+        elif rec.time == 17:
+            note = "w_occ 降到 low=1：AF 才清除"
+        print(f"t={rec.time:>2} {edge}  W:{accw} R:{accr} | "
+              f"w_occ={wocc:>2}   r_rd={rrd:>2}  | "
+              f"AF={int(rec.almost_full_after)}            "
+              f"AE={int(rec.almost_empty_after)} | {note}")
+
+    # Hints never gate access: at t=3 AF is set with real occupancy 3 and
+    # full still clear, yet the next write is accepted purely on full/empty.
+    self_checks = [
+        (rows[2].time, rows[2].almost_full_after, True, "t=3 AF 置位"),
+        (rows[3].time, rows[3].w_accept, True, "t=4 提示已置位但写仍被接受"),
+        (rows[14].time, rows[14].almost_full_after, True, "t=15 迟滞带保持"),
+        (rows[16].time, rows[16].almost_full_after, False, "t=17 到 low 才清除"),
+    ]
+    for t, got, want, label in self_checks:
+        assert got == want, f"{label}: 期望 {want}，实际 {got}"
+    print("\n断言核对：" + "；".join(label for *_x, label in self_checks) + " —— 全部成立")
+
+    print("\n非法阈值（构造期真实抛出并就地捕获）：")
+    illegal_cases = [
+        ("low == high", dict(almost_full_low=2, almost_full_high=2)),
+        ("low > high", dict(almost_empty_low=3, almost_empty_high=1)),
+        ("超过 depth", dict(almost_full_low=1, almost_full_high=5)),
+    ]
+    for desc, kw in illegal_cases:
+        try:
+            AsyncFIFO(k=2, **kw)
+        except AsyncFIFOError as exc:
+            print(f"  [{desc}] AsyncFIFOError: {exc}")
+        else:
+            raise AssertionError(f"{desc} 应当抛出 AsyncFIFOError")
+
+
 def main():
     section_normal()
     section_wrap()
+    section_almost()
     section_boundary()
     print("\n演示完成：以上数值均由模型实时计算；抽象队列独立核对全部通过。")
 
