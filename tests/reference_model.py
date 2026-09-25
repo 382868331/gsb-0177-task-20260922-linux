@@ -125,3 +125,93 @@ def make_schedule(k, n_steps, *, w_period, r_period, seed=1, stop_windows=(),
             payload += 1
         events.append((t, wclk, rclk, wen, ren, data))
     return events
+
+
+class RefReadyValid:
+    """Independent reference for the ready/valid output-register wrapper.
+
+    Re-derives the wrapper contract from scratch (never imports ``afifo``):
+    the wrapper issues ``ren = (not out_valid) or ready`` into an inner
+    :class:`RefFIFO`; a delivery happens exactly when the OLD ``out_valid``
+    and ``ready`` are both true on a read edge.  Two independent sequences
+    are maintained: accepted writes (``written``) and downstream deliveries
+    (``delivered_seq``); the test asserts the second is a prefix of the first.
+    """
+
+    def __init__(self, k: int) -> None:
+        self.inner = RefFIFO(k)
+        self.out_valid = False
+        self.out_data = None
+        self.n_delivered = 0
+        self.written = []        # accepted writes, in order
+        self.delivered_seq = []  # downstream deliveries, in order
+
+    def reset(self) -> None:
+        self.inner.reset()
+        self.out_valid = False
+        self.out_data = None
+        self.n_delivered = 0
+        self.written = []
+        self.delivered_seq = []
+
+    def step(self, wclk, rclk, wen, ready, wdata=None):
+        if rclk:
+            ren = (not self.out_valid) or ready
+            consume = self.out_valid and ready
+        else:
+            ren = False
+            consume = False
+        exp = self.inner.step(wclk, rclk, wen, ren, wdata)
+        if exp["w_accept"]:
+            self.written.append(wdata)
+        if rclk:
+            if consume:
+                self.n_delivered += 1
+                self.delivered_seq.append(self.out_data)
+            if exp["r_accept"]:
+                self.out_valid = True
+                self.out_data = exp["rdata"]
+            elif consume:
+                self.out_valid = False
+                # register holds its last bits while invalid (don't-care)
+        return {
+            "ren": ren if rclk else None,
+            "consume": consume if rclk else None,
+            "out_valid": self.out_valid,
+            "out_data": self.out_data,
+            "inner": exp,
+        }
+
+
+def make_rv_schedule(k, n_steps, *, w_period, r_period, seed=1,
+                     stop_windows=(), r_stop_windows=(),
+                     backpressure_windows=()):
+    """Build ``(t, wclk, rclk, wen, ready, payload)`` tuples.
+
+    Like :func:`make_schedule` but the read side carries ``ready`` instead of
+    ``ren``.  ``backpressure_windows`` are ``(lo, hi)`` time intervals in
+    which ``ready`` is held low continuously (sustained backpressure).
+    """
+    rnd = lcg_stream(seed)
+    events = []
+    t = 0
+    payload = 0
+    while len(events) < n_steps:
+        t += 1
+        wclk = (t % w_period == 0)
+        rclk = (t % r_period == 0)
+        if any(lo <= t < hi for lo, hi in stop_windows):
+            wclk = False
+        if any(lo <= t < hi for lo, hi in r_stop_windows):
+            rclk = False
+        if not (wclk or rclk):
+            continue
+        wen = bool(wclk and (next(rnd) & 3))
+        ready = bool(next(rnd) & 1)
+        if any(lo <= t < hi for lo, hi in backpressure_windows):
+            ready = False
+        data = payload if wen else None
+        if wen:
+            payload += 1
+        events.append((t, wclk, rclk, wen, ready, data))
+    return events

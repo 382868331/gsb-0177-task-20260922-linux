@@ -11,7 +11,7 @@ independent abstract ``collections.deque``.
 
 from collections import deque
 
-from afifo import AsyncFIFO, Event
+from afifo import AsyncFIFO, Event, ReadyValidFIFO, RVEvent
 from afifo.model import AsyncFIFOError
 
 
@@ -176,6 +176,94 @@ def section_wrap():
     assert fifo.accepted_writes - fifo.accepted_reads == len(q)
 
 
+# Fixed schedule for the ready/valid wrapper, k=1 (depth 2).  Both clocks
+# edge every step; rows are (time, wen, ready, wdata).  ready is held low
+# for a sustained backpressure stretch (t=1..9).
+RV_SCHEDULE = [
+    (1, 1, 0, "A"),   # 写 A 接受
+    (2, 1, 0, "B"),   # 写 B 接受，full 置位
+    (3, 0, 0, None),  # 写已入队但未跨域可见：发 ren 但 r_accept=0，不预取
+    (4, 0, 0, None),  # 同上；本拍末 empty 撤销
+    (5, 0, 0, None),  # 出队接受：A 装入输出寄存器（预取）
+    (6, 0, 0, None),  # ready=0 背压：ren=0，读指针冻结，A 保持稳定
+    (7, 0, 0, None),
+    (8, 0, 0, None),  # 本拍末 full 终见读指针而撤销
+    (9, 1, 0, "C"),   # 写 C 接受：在途=3=深度2+输出寄存器1（寄存器不占 depth）
+    (10, 0, 1, None), # ready=1：同拍交付 A 并装入 B
+    (11, 0, 1, None), # 交付 B；核心暂空（C 尚未同步到读域），valid 落 0
+    (12, 0, 1, None), # 等同步；本拍末 empty 撤销
+    (13, 0, 1, None), # 出队接受：C 装入输出寄存器
+    (14, 0, 1, None), # 交付 C
+]
+
+
+def section_readyvalid():
+    print("\n" + "=" * 106)
+    print("ready/valid 输出寄存器：k=1，核心深度 2。固定字面值调度，双时钟同刻，含连续背压与同拍消费+装入")
+    print("=" * 106)
+    fifo = ReadyValidFIFO(k=1)
+    print(f"复位态: out_valid={fifo.out_valid} out_data={fifo.out_data} "
+          f"delivered={fifo.delivered} full={fifo.full} empty={fifo.empty}\n")
+
+    events = [RVEvent(t, True, True, bool(we), bool(rd), d)
+              for (t, we, rd, d) in RV_SCHEDULE]
+    records = fifo.run(events)
+
+    print("t    wen rdy | W接受 ren R接受 交付 | out_valid out_data "
+          "| wptr rptr | F E")
+    for rec in records:
+        wa = {True: "A", False: "x"}[rec.w_accept]
+        ren = "1" if rec.ren_issued else "0"
+        ra = {True: "A", False: "x"}[rec.r_accept]
+        dl = "1" if rec.delivered else "0"
+        od = rec.out_data_after if rec.out_valid_after else "-"
+        print(f"t={rec.time:>2}  {int(rec.wen)}   {int(rec.ready)}   | "
+              f"{wa}    {ren}   {ra}    {dl}   | "
+              f"{int(rec.out_valid_after)}         {od!s:<4}      "
+              f"| {rec.inner.wptr_after:02b}    {rec.inner.rptr_after:02b}   "
+              f"| {int(rec.inner.full_after)} {int(rec.inner.empty_after)}")
+
+    # independent abstract-queue audit on the two reference sequences
+    written = [r.wdata for r in records if r.w_accept]
+    delivered_seq = []
+    for rec in records:
+        if rec.delivered:
+            delivered_seq.append(rec.out_data_before)
+    print(f"\n  接受写入序列 = {written}")
+    print(f"  下游交付序列 = {delivered_seq}（交付计数只算 旧valid且ready）")
+    assert delivered_seq == written[: fifo.delivered]
+    assert written == ["A", "B", "C"] and delivered_seq == ["A", "B", "C"]
+
+    print(f"\n  背压期间（t=9 末）在途上限实测：接受写3 - 交付0 = 3 "
+          f"= 核心深度{fifo.depth} + 输出寄存器1")
+    print(f"  depth 属性仍为 {fifo.depth}：输出寄存器不计入 depth，"
+          f"预取使系统在途容量比核心深度多 1")
+    assert fifo.depth == 2
+    assert fifo.accepted_writes == 3 and fifo.delivered == 3
+
+    hold = [r for r in records if 6 <= r.time <= 8]
+    assert all(r.out_data_after == "A" and not r.ren_issued
+               and r.inner.rptr_after == 1 for r in hold)
+    print(f"  t=6..8 背压：ren=0、读指针冻结在 1、out_data 稳定为 'A'")
+
+    same = records[9]  # t=10
+    assert same.delivered and same.r_accept
+    assert same.out_data_before == "A" and same.out_data_after == "B"
+    print(f"  t=10 同拍：交付旧值 'A' 并装入新值 'B'，valid 保持 1")
+
+    noprefetch = [r for r in records if 2 <= r.time <= 4]
+    assert all(r.r_accept is False and not r.out_valid_after
+               for r in noprefetch)
+    print(f"  t=2..4：真实队列已有 2 字但未跨域可见，r_accept=0，不凭长度预取")
+
+    # reset while the output register is full
+    fifo.reset()
+    print(f"\n  输出寄存器满时复位：out_valid={fifo.out_valid} "
+          f"out_data={fifo.out_data} delivered={fifo.delivered} "
+          f"empty={fifo.empty}（valid 已清）")
+    assert not fifo.out_valid and fifo.delivered == 0 and fifo.empty
+
+
 def section_boundary():
     print("\n" + "=" * 106)
     print("实际触发的拒绝/异常边界（模型真实抛出并就地捕获，非预录文本）")
@@ -240,6 +328,7 @@ def section_boundary():
 def main():
     section_normal()
     section_wrap()
+    section_readyvalid()
     section_boundary()
     print("\n演示完成：以上数值均由模型实时计算；抽象队列独立核对全部通过。")
 

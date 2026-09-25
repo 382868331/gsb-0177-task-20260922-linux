@@ -3,6 +3,9 @@
 离散事件的异步 FIFO 指针/旗标硬件模型，用于离线数字硬件验证。仅用 Python
 标准库从零实现，核心算法不依赖、不调用任何第三方 FIFO 实现。
 
+读侧另提供 `ReadyValidFIFO`：在**不改动**核心写域协议与跨域同步器的前提
+下，给异步 FIFO 外包一个读域 ready/valid 输出寄存器，供下游握手消费。
+
 ## 环境与依赖
 
 - Python **3.14.7**（Linux 原生验证；不使用 3.14 之外的语法特性时亦可在
@@ -13,24 +16,29 @@
 ## 准确命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（28 个用例）
-python demo.py                            # 固定输入演示，实时计算
+./.venv/bin/python -m unittest discover -s tests -v   # 必要测试（41 个用例）
+./.venv/bin/python demo.py                            # 固定输入演示，实时计算
 ```
 
+（仓库自带 `.venv`，即 Python 3.14.7；任何 3.14.7 解释器等价。）
+
 `demo.py` 为固定字面值调度（无随机、无 `sleep`、无预录输出），在本机实测
-远小于 8 秒（约 0.03 秒），打印一段正常工作轨迹、一段指针回绕轨迹，以及
-真实触发的硬件拒绝与契约异常。
+远小于 90 秒（约 0.04 秒），打印一段正常工作轨迹、一段指针回绕轨迹、一段
+ready/valid 输出寄存器轨迹（含连续背压与同拍消费+装入），以及真实触发的
+硬件拒绝与契约异常。
 
 ## 包结构与公开接口
 
 ```
 afifo/
   __init__.py
-  gray.py     # binary_to_gray / gray_to_binary
-  model.py    # AsyncFIFO, Event, EdgeRecord, AsyncFIFOError
+  gray.py        # binary_to_gray / gray_to_binary
+  model.py       # AsyncFIFO, Event, EdgeRecord, AsyncFIFOError
+  readyvalid.py  # ReadyValidFIFO, RVEvent, RVRecord（读域输出寄存器包装）
 tests/
   reference_model.py  # 独立参考（不 import afifo）+ 抽象队列核对
   test_afifo.py
+  test_readyvalid.py
 demo.py
 ```
 
@@ -65,6 +73,39 @@ w2r_before/after, wdata, rdata`。
   接受/拒绝。
 - `r2w`/`w2r` 为 `(一级同步, 二级同步)` 格雷元组；`before` 是边沿采样的
   旧寄存器值。
+
+### `ReadyValidFIFO(k)` — 读域 ready/valid 输出寄存器包装
+
+在**未修改**的 `AsyncFIFO` 核心外叠加一个读域输出寄存器；写域协议、格雷
+指针与两级同步器语义与核心完全一致。
+
+- `run_one(RVEvent)` / `run(iterable)` / `reset()`：与核心同样的契约
+  （严格递增时间、原子批次、单批上限 100 000）。
+- `RVEvent(time, wclk, rclk, wen=False, ready=False, wdata=None)`：读侧
+  只有 `ready`；**出队请求由包装器自己生成**，调用方不再提供 `ren`。
+- 属性：`out_valid`、`out_data`、`delivered`（下游交付计数）、
+  `accepted_writes`、`accepted_reads`（核心出队=装入次数）、`in_flight`
+  （= 接受写 − 交付）、`depth`、`full`、`empty`、`steps`、`inner`、
+  `snapshot()`。
+- `RVRecord` 每步轨迹：`ren_issued`（包装器实际发出的出队请求）、
+  `r_accept`、`delivered`（本拍是否交付）、`out_valid/out_data` 前后值，
+  以及完整的核心轨迹 `inner: EdgeRecord`。
+
+输出寄存器语义（读域寄存器，复位清 valid）：
+
+1. 仅当**输出寄存器为空**（`not out_valid`）**或当前值正被 ready 消费**
+   时，才发出 `ren = 1`；出队是否发生仍只看核心的**读域旧 empty**。
+2. `out_valid=1 且 ready=0`：`ren=0`，读指针冻结，`out_data` 逐位稳定。
+3. 读沿上**消费旧值与装入新值可同拍完成**（`delivered` 与 `r_accept`
+   同拍为真，valid 保持 1）；交付计数只统计“旧 valid 且 ready”的读沿。
+4. 已接受写入但尚未跨域同步到读域的数据**不会被凭真实队列长度预取**：
+   同步延迟期间 `ren` 照发但 `r_accept=0`、`out_valid` 保持 0。
+5. 出队接受但核心暂空（empty 保守）时，若旧值被消费则 valid 落 0；
+   `out_data` 保持旧位（无效期间为 don't-care）。
+
+**容量口径**：输出寄存器**不**计入 `depth`——`depth` 仍是核心深度 2^k；
+由于预取，系统在途（接受写 − 交付）最多为 **depth + 1**（核心满 depth
+字，输出寄存器再预取 1 字）。`demo.py` 的 ready/valid 段实测到该上限。
 
 ### 错误语义
 
@@ -107,10 +148,18 @@ w2r_before/after, wdata, rdata`。
 ## 验证方法
 
 - **手工锚点**：`tests/test_afifo.py` 含手工推导的格雷表（0..15）与一张
-  k=1 的完整复位→填满→保守拒绝→排空寄存器波形表（逐字段比对）。
+  k=1 的完整复位→填满→保守拒绝→排空寄存器波形表（逐字段比对）；
+  `tests/test_readyvalid.py` 另含一张手工推导的 k=1 ready/valid 波形段
+  （t=1..9：同步延迟不预取→装入→背压保持→同拍消费+装入→valid 落 0），
+  逐拍核对 `ren_issued`、`r_accept`、`delivered`、`out_valid/out_data`
+  与全部核心寄存器。
 - **独立参考差分**：`tests/reference_model.py` 不导入 `afifo`，独立重述
-  格雷公式与全部时序；对 k=1..5、9 种时钟频比（含同刻）、停钟窗口、
-  长程回绕（k=1 与 k=5）逐寄存器差分。
+  格雷公式、全部时序与输出寄存器规则（`RefFIFO` / `RefReadyValid`）。
+  对 k=1..5、多种时钟频比（含同刻双沿）、停钟窗口、连续背压窗口、长程
+  回绕（k=1 与 k=5）逐寄存器差分。
+- **双参考序列**：参考模型独立维护“被接受的写入”与“下游交付”两条
+  序列，断言交付序列恒为写入序列的前缀，且
+  `在途 = 核心队列残留 + 输出寄存器占位 <= depth + 1`。
 - **抽象队列核对**：另用 `collections.deque` 仅核对“已接受数据”的 FIFO
   顺序与占用恒在 `[0, 深度]`（防越界），它不参与被测旗标逻辑。
 - 格雷 `gray_to_binary(binary_to_gray(v)) == v` 仅作补充往返检查。
@@ -134,8 +183,11 @@ w2r_before/after, wdata, rdata`。
 ## 已知限制 / 非目标
 
 - 只实现本题契约的**有限子集**：k=1..5、离散整数时间、单一二进制反射
-  格雷与两级同步；**不宣称兼容任何行业标准总线/FIFO 规范**，不建模
-  亚稳态概率、复位释放同步、时序约束或真实 FPGA 原语。
+  格雷与两级同步、单级 ready/valid 输出寄存器；**不宣称兼容任何行业
+  标准总线/FIFO 规范**，不建模亚稳态概率、复位释放同步、时序约束或
+  真实 FPGA 原语。
+- 输出寄存器为**单级**（非两级 skid buffer/pipeline 寄存器）；`ready`
+  在读沿采样，无组合前传（fall-through）路径。
 - 不做几乎满/几乎空（almost-full/empty）、分组计数、数据校验（ECC/
   parity）、多写多读端口。
 - 不提供网站、通用 CLI、看板或持久化；终端命令仅用于测试与演示。
