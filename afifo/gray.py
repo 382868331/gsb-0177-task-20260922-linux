@@ -35,3 +35,17 @@ def gray_to_binary(gray: int) -> int:
         bits >>= 1
         gray ^= bits
     return gray
+
+
+def forward_distance(leader: int, follower: int, modulus: int) -> int:
+    """Wrap-aware forward distance from follower to leader using generations."""
+    if (
+        isinstance(leader, bool)
+        or isinstance(follower, bool)
+        or isinstance(modulus, bool)
+        or not all(isinstance(v, int) for v in (leader, follower, modulus))
+    ):
+        raise TypeError("forward_distance expects integer arguments")
+    if leader < 0 or follower < 0 or modulus <= 0:
+        raise ValueError("forward_distance expects valid pointer arguments")
+    return (leader - follower) % modulus

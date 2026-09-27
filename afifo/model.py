@@ -29,9 +29,17 @@ that domain, synchronizers included.
 import math
 from typing import Any, NamedTuple, Optional
 
-from .gray import binary_to_gray
+from .gray import binary_to_gray, forward_distance, gray_to_binary
 
-__all__ = ["AsyncFIFO", "AsyncFIFOError", "Event", "EdgeRecord"]
+__all__ = [
+    "AsyncFIFO",
+    "DualReaderAsyncFIFO",
+    "AsyncFIFOError",
+    "Event",
+    "DualReaderEvent",
+    "EdgeRecord",
+    "DualReaderEdgeRecord",
+]
 
 _TIME_MAX = 2 ** 63 - 1
 _BATCH_MAX = 100_000
@@ -170,6 +178,120 @@ class EdgeRecord(NamedTuple):
     w2r_after: tuple
     wdata: Any
     rdata: Any
+
+
+class DualReaderEvent:
+    """One time step for one write clock and two independent read clocks."""
+
+    __slots__ = (
+        "time", "wclk", "r0clk", "r1clk",
+        "wen", "r0en", "r1en", "wdata",
+    )
+
+    def __init__(
+        self,
+        time: int,
+        wclk: bool,
+        r0clk: bool,
+        r1clk: bool,
+        wen: bool = False,
+        r0en: bool = False,
+        r1en: bool = False,
+        wdata: Any = None,
+    ) -> None:
+        t = _strict_int(time, "time", lo=0, hi=_TIME_MAX)
+        clocks = {
+            "wclk": _strict_bool(wclk, "wclk"),
+            "r0clk": _strict_bool(r0clk, "r0clk"),
+            "r1clk": _strict_bool(r1clk, "r1clk"),
+        }
+        write_en = _strict_bool(wen, "wen")
+        read0_en = _strict_bool(r0en, "r0en")
+        read1_en = _strict_bool(r1en, "r1en")
+        if not any(clocks.values()):
+            raise AsyncFIFOError(
+                f"event at time={t} has wclk, r0clk and r1clk all False; "
+                "at least one clock edge is required"
+            )
+        if not write_en and wdata is not None:
+            raise AsyncFIFOError(
+                f"event at time={t}: wdata must be None when wen is False"
+            )
+        if isinstance(wdata, float) and not math.isfinite(wdata):
+            raise AsyncFIFOError(
+                f"event at time={t}: float wdata must be finite; got "
+                "non-finite value (NaN/Infinity is rejected)"
+            )
+        self.time = t
+        self.wclk = clocks["wclk"]
+        self.r0clk = clocks["r0clk"]
+        self.r1clk = clocks["r1clk"]
+        self.wen = write_en
+        self.r0en = read0_en
+        self.r1en = read1_en
+        self.wdata = wdata
+
+    def __iter__(self):
+        return iter((
+            self.time, self.wclk, self.r0clk, self.r1clk,
+            self.wen, self.r0en, self.r1en, self.wdata,
+        ))
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, DualReaderEvent):
+            return NotImplemented
+        return tuple(self) == tuple(other)
+
+    def __repr__(self) -> str:
+        return (
+            f"DualReaderEvent(time={self.time}, wclk={self.wclk}, "
+            f"r0clk={self.r0clk}, r1clk={self.r1clk}, wen={self.wen}, "
+            f"r0en={self.r0en}, r1en={self.r1en}, wdata={self.wdata!r})"
+        )
+
+
+class DualReaderEdgeRecord(NamedTuple):
+    """Register trace for the one-writer/two-independent-reader FIFO."""
+
+    time: int
+    wclk: bool
+    r0clk: bool
+    r1clk: bool
+    wen: bool
+    r0en: bool
+    r1en: bool
+    w_accept: Optional[bool]
+    r0_accept: Optional[bool]
+    r1_accept: Optional[bool]
+    wptr_before: int
+    wptr_after: int
+    r0ptr_before: int
+    r0ptr_after: int
+    r1ptr_before: int
+    r1ptr_after: int
+    wgray_before: int
+    wgray_after: int
+    r0gray_before: int
+    r0gray_after: int
+    r1gray_before: int
+    r1gray_after: int
+    full_before: bool
+    full_after: bool
+    empty0_before: bool
+    empty0_after: bool
+    empty1_before: bool
+    empty1_after: bool
+    r02w_before: tuple
+    r02w_after: tuple
+    r12w_before: tuple
+    r12w_after: tuple
+    w2r0_before: tuple
+    w2r0_after: tuple
+    w2r1_before: tuple
+    w2r1_after: tuple
+    wdata: Any
+    r0data: Any
+    r1data: Any
 
 
 class AsyncFIFO:
@@ -394,6 +516,275 @@ class AsyncFIFO:
             w2r_after=(w2r_s1_n, w2r_s2_n),
             wdata=event.wdata,
             rdata=rdata,
+        )
+        self._steps.append(record)
+        return record
+
+
+class DualReaderAsyncFIFO:
+    """Asynchronous FIFO with one writer and two independent read domains.
+
+    Every accepted payload is retained until both reader pointers have passed
+    it.  The write domain receives both read pointers through independent
+    two-stage Gray synchronizers and accepts a write only when the slowest
+    synchronized reader leaves a free slot.
+    """
+
+    def __init__(self, k: int) -> None:
+        self._k = _strict_int(k, "k", lo=1, hi=5)
+        self._depth = 1 << k
+        self._modulus = 1 << (k + 1)
+        self._mask = self._modulus - 1
+        self._addr_mask = self._depth - 1
+        self.reset()
+
+    def reset(self) -> None:
+        """Apply a common reset and clear all traces."""
+        self._wptr = 0
+        self._rptrs = [0, 0]
+        self._full = False
+        self._empties = [True, True]
+        self._r2w_s1 = [0, 0]
+        self._r2w_s2 = [0, 0]
+        self._w2r_s1 = [0, 0]
+        self._w2r_s2 = [0, 0]
+        self._mem = [None] * self._depth
+        self._steps = []
+        self._last_time = -1
+        self._accepted_writes = 0
+        self._accepted_reads = [0, 0]
+
+    @property
+    def k(self) -> int:
+        return self._k
+
+    @property
+    def depth(self) -> int:
+        return self._depth
+
+    @property
+    def full(self) -> bool:
+        return self._full
+
+    @property
+    def empty(self) -> tuple[bool, bool]:
+        return (self._empties[0], self._empties[1])
+
+    @property
+    def wptr(self) -> int:
+        return self._wptr
+
+    @property
+    def r0ptr(self) -> int:
+        return self._rptrs[0]
+
+    @property
+    def r1ptr(self) -> int:
+        return self._rptrs[1]
+
+    @property
+    def steps(self) -> tuple:
+        return tuple(self._steps)
+
+    @property
+    def accepted_writes(self) -> int:
+        return self._accepted_writes
+
+    @property
+    def accepted_reads(self) -> tuple[int, int]:
+        return (self._accepted_reads[0], self._accepted_reads[1])
+
+    def snapshot(self) -> dict:
+        return {
+            "wptr": self._wptr,
+            "r0ptr": self._rptrs[0],
+            "r1ptr": self._rptrs[1],
+            "wgray": binary_to_gray(self._wptr),
+            "r0gray": binary_to_gray(self._rptrs[0]),
+            "r1gray": binary_to_gray(self._rptrs[1]),
+            "full": self._full,
+            "empty0": self._empties[0],
+            "empty1": self._empties[1],
+            "r02w": (self._r2w_s1[0], self._r2w_s2[0]),
+            "r12w": (self._r2w_s1[1], self._r2w_s2[1]),
+            "w2r0": (self._w2r_s1[0], self._w2r_s2[0]),
+            "w2r1": (self._w2r_s1[1], self._w2r_s2[1]),
+            "last_time": self._last_time,
+        }
+
+    def run_one(self, event: "DualReaderEvent") -> "DualReaderEdgeRecord":
+        if not isinstance(event, DualReaderEvent):
+            raise AsyncFIFOError(
+                "run_one expects a DualReaderEvent; got "
+                f"{type(event).__name__}: {event!r}"
+            )
+        if event.time <= self._last_time:
+            raise AsyncFIFOError(
+                f"event time {event.time} must be strictly greater than the "
+                f"last processed time {self._last_time}"
+            )
+        return self._step(event)
+
+    def run(self, events) -> list:
+        if isinstance(events, DualReaderEvent):
+            raise AsyncFIFOError(
+                "run expects an iterable of DualReaderEvent objects; got a "
+                "single DualReaderEvent (use run_one)"
+            )
+        try:
+            batch = list(events)
+        except TypeError as exc:
+            raise AsyncFIFOError(
+                "run expects an iterable of DualReaderEvent objects"
+            ) from exc
+        if len(batch) > _BATCH_MAX:
+            raise AsyncFIFOError(
+                f"batch size {len(batch)} exceeds the {_BATCH_MAX} event limit"
+            )
+        prev = self._last_time
+        for i, event in enumerate(batch):
+            if not isinstance(event, DualReaderEvent):
+                raise AsyncFIFOError(
+                    f"events[{i}] must be a DualReaderEvent; got "
+                    f"{type(event).__name__}: {event!r}"
+                )
+            if event.time <= prev:
+                raise AsyncFIFOError(
+                    f"events[{i}] time {event.time} is not strictly greater "
+                    f"than the previous time {prev}"
+                )
+            prev = event.time
+        return [self._step(event) for event in batch]
+
+    def _step(self, event: "DualReaderEvent") -> "DualReaderEdgeRecord":
+        wptr_o = self._wptr
+        rptrs_o = (self._rptrs[0], self._rptrs[1])
+        full_o = self._full
+        empties_o = (self._empties[0], self._empties[1])
+        r2w_s1_o = (self._r2w_s1[0], self._r2w_s1[1])
+        r2w_s2_o = (self._r2w_s2[0], self._r2w_s2[1])
+        w2r_s1_o = (
+            self._w2r_s1[0],
+            self._w2r_s1[1],
+        )
+        w2r_s2_o = (
+            self._w2r_s2[0],
+            self._w2r_s2[1],
+        )
+        wgray_o = binary_to_gray(wptr_o)
+        rgrays_o = (binary_to_gray(rptrs_o[0]), binary_to_gray(rptrs_o[1]))
+        read_clocks = (event.r0clk, event.r1clk)
+        read_enables = (event.r0en, event.r1en)
+
+        w_accept = bool(event.wen and not full_o) if event.wclk else None
+        read_accepts = tuple(
+            bool(read_enables[i] and not empties_o[i])
+            if read_clocks[i]
+            else None
+            for i in range(2)
+        )
+
+        wptr_n = (wptr_o + (1 if w_accept else 0)) & self._mask
+        rptrs_n = tuple(
+            (rptrs_o[i] + (1 if read_accepts[i] else 0)) & self._mask
+            for i in range(2)
+        )
+        wgray_n = binary_to_gray(wptr_n)
+        rgrays_n = tuple(binary_to_gray(rptrs_n[i]) for i in range(2))
+
+        rdata = [None, None]
+        if w_accept:
+            self._mem[wptr_o & self._addr_mask] = event.wdata
+            self._accepted_writes += 1
+        for i in range(2):
+            if read_accepts[i]:
+                rdata[i] = self._mem[rptrs_o[i] & self._addr_mask]
+                self._accepted_reads[i] += 1
+
+        full_n = full_o
+        if event.wclk:
+            distances = (
+                forward_distance(
+                    wptr_n,
+                    gray_to_binary(r2w_s2_o[0]),
+                    self._modulus,
+                ),
+                forward_distance(
+                    wptr_n,
+                    gray_to_binary(r2w_s2_o[1]),
+                    self._modulus,
+                ),
+            )
+            full_n = max(distances) >= self._depth
+
+        empties_n = list(empties_o)
+        for i in range(2):
+            if read_clocks[i]:
+                empties_n[i] = rgrays_n[i] == w2r_s2_o[i]
+
+        r2w_s1_n = list(r2w_s1_o)
+        r2w_s2_n = list(r2w_s2_o)
+        if event.wclk:
+            r2w_s1_n = [rgrays_o[0], rgrays_o[1]]
+            r2w_s2_n = [r2w_s1_o[0], r2w_s1_o[1]]
+
+        w2r_s1_n = list(w2r_s1_o)
+        w2r_s2_n = list(w2r_s2_o)
+        for i in range(2):
+            if read_clocks[i]:
+                w2r_s1_n[i] = wgray_o
+                w2r_s2_n[i] = w2r_s1_o[i]
+
+        self._wptr = wptr_n
+        self._rptrs = list(rptrs_n)
+        self._full = full_n
+        self._empties = empties_n
+        self._r2w_s1 = r2w_s1_n
+        self._r2w_s2 = r2w_s2_n
+        self._w2r_s1 = w2r_s1_n
+        self._w2r_s2 = w2r_s2_n
+        self._last_time = event.time
+
+        record = DualReaderEdgeRecord(
+            time=event.time,
+            wclk=event.wclk,
+            r0clk=event.r0clk,
+            r1clk=event.r1clk,
+            wen=event.wen,
+            r0en=event.r0en,
+            r1en=event.r1en,
+            w_accept=w_accept,
+            r0_accept=read_accepts[0],
+            r1_accept=read_accepts[1],
+            wptr_before=wptr_o,
+            wptr_after=wptr_n,
+            r0ptr_before=rptrs_o[0],
+            r0ptr_after=rptrs_n[0],
+            r1ptr_before=rptrs_o[1],
+            r1ptr_after=rptrs_n[1],
+            wgray_before=wgray_o,
+            wgray_after=wgray_n,
+            r0gray_before=rgrays_o[0],
+            r0gray_after=rgrays_n[0],
+            r1gray_before=rgrays_o[1],
+            r1gray_after=rgrays_n[1],
+            full_before=full_o,
+            full_after=full_n,
+            empty0_before=empties_o[0],
+            empty0_after=empties_n[0],
+            empty1_before=empties_o[1],
+            empty1_after=empties_n[1],
+            r02w_before=(r2w_s1_o[0], r2w_s2_o[0]),
+            r02w_after=(r2w_s1_n[0], r2w_s2_n[0]),
+            r12w_before=(r2w_s1_o[1], r2w_s2_o[1]),
+            r12w_after=(r2w_s1_n[1], r2w_s2_n[1]),
+            w2r0_before=(w2r_s1_o[0], w2r_s2_o[0]),
+            w2r0_after=(w2r_s1_n[0], w2r_s2_n[0]),
+            w2r1_before=(w2r_s1_o[1], w2r_s2_o[1]),
+            w2r1_after=(w2r_s1_n[1], w2r_s2_n[1]),
+            wdata=event.wdata,
+            r0data=rdata[0],
+            r1data=rdata[1],
         )
         self._steps.append(record)
         return record

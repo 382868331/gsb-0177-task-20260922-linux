@@ -3,6 +3,12 @@
 离散事件的异步 FIFO 指针/旗标硬件模型，用于离线数字硬件验证。仅用 Python
 标准库从零实现，核心算法不依赖、不调用任何第三方 FIFO 实现。
 
+当前基线同时提供两套模型：
+
+- `AsyncFIFO`：保留基线的一写一读模型与原有公开接口/测试。
+- `DualReaderAsyncFIFO`：本次增量，一个写端、两个各自有时钟和使能的读端；
+  每条数据由两个读端分别消费一次，存储槽由较慢读者释放。
+
 ## 环境与依赖
 
 - Python **3.14.7**（Linux 原生验证；不使用 3.14 之外的语法特性时亦可在
@@ -10,28 +16,39 @@
 - **无第三方依赖**，无需安装任何包；离线运行，不访问网络、硬件、数据库或
   云服务。
 
+推荐使用隔离 venv（无需安装第三方包）：
+
+```bash
+python3.14 -m venv .venv
+. .venv/bin/activate
+python --version            # 期望 3.14.7；无网络和账号要求
+```
+
 ## 准确命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（28 个用例）
-python demo.py                            # 固定输入演示，实时计算
+python -m unittest discover -s tests -v   # 基线回归 + 双读端测试（37 个用例）
+python demo.py                            # 基线一写一读固定输入演示
+python demo_iteration.py                  # 一写两读离线演示（<90 秒）
 ```
 
-`demo.py` 为固定字面值调度（无随机、无 `sleep`、无预录输出），在本机实测
-远小于 8 秒（约 0.03 秒），打印一段正常工作轨迹、一段指针回绕轨迹，以及
-真实触发的硬件拒绝与契约异常。
+两个演示均为固定字面值调度（无随机、无 `sleep`、无预录输出、无账号/密钥/网络）。
+`demo_iteration.py` 在本机实测约 0.04 秒，展示 R0 停钟时 R1 继续读、写端最终
+背压、慢读者释放槽位、双队列独立顺序和指针多次回绕。
 
 ## 包结构与公开接口
 
 ```
 afifo/
   __init__.py
-  gray.py     # binary_to_gray / gray_to_binary
-  model.py    # AsyncFIFO, Event, EdgeRecord, AsyncFIFOError
+  gray.py     # binary_to_gray / gray_to_binary / forward_distance
+  model.py    # 单读端和双读端事件模型、轨迹与错误类型
 tests/
-  reference_model.py  # 独立参考（不 import afifo）+ 抽象队列核对
-  test_afifo.py
+  reference_model.py    # 两个独立参考（不 import afifo）+ 抽象队列核对
+  test_afifo.py         # 基线一写一读回归
+  test_dual_reader.py   # 一写两读增量测试
 demo.py
+demo_iteration.py
 ```
 
 ### `AsyncFIFO(k)`
@@ -53,6 +70,47 @@ demo.py
 - `wen`/`ren`：必须为 `bool`。
 - `wdata`：`wen=False` 时必须为 `None`；浮点载荷必须有限（NaN、+/-Inf
   一律拒绝）。其他类型载荷原样存入按地址寻址的存储器。
+
+### `DualReaderAsyncFIFO(k)`
+
+一写两读模型的构造参数和 `k=1..5`、深度、指针宽度、原子批次、共同复位、
+时间戳、载荷限制均与基线相同。
+
+- `run_one(DualReaderEvent(...)) -> DualReaderEdgeRecord`
+- `run(iterable_of_dual_events) -> list[DualReaderEdgeRecord]`
+- `reset()`：共同复位，写端、两个读端、全部同步器、存储器和轨迹一起复位。
+- 属性：`wptr`、`r0ptr`、`r1ptr`、`full`、`empty=(empty0, empty1)`、
+  `accepted_writes`、`accepted_reads=(n0,n1)`、`steps`、`snapshot()`。
+
+### `DualReaderEvent(time, wclk, r0clk, r1clk, wen=False, r0en=False, r1en=False, wdata=None)`
+
+- `wclk/r0clk/r1clk` 必须为 `bool`，三者不能同时为 `False`。
+- `wen/r0en/r1en` 必须为 `bool`；两个读域的时钟、使能、指针、empty 和同步器
+  完全独立。
+- 运行中没有取消订阅接口；两个读端从共同复位开始始终存在，因此满判断不需要
+  动态订阅状态。
+
+### 一写两读占用与满旗标
+
+每个读指针和写指针仍是带一个回绕/世代位的 `k+1` 位二进制计数器，跨时钟域
+只传格雷码。写域分别维护 `r0→w`、`r1→w` 两级同步器；每个读域维护自己的
+`w→r` 两级同步器。
+
+占用距离使用 `forward_distance(write, read, 2**(k+1)) = (write-read) % modulus`。
+不能对模 `2^(k+1)` 回绕后的普通无符号值直接取 `min`：例如 modulus=4 时，
+写指针从 3 回绕到 0，相对仍停在 3 的读指针前向距离是 1，不是 3。写端每个写沿
+计算：
+
+```text
+full_next = max(distance(wptr_next, sync_r0), distance(wptr_next, sync_r1)) >= depth
+```
+
+因此 R0 停钟时，R1 可以继续按自己的 `empty0/1` 和读指针消费已有数据；只要 R0
+尚未释放，写端在同步延迟后进入背压并拒绝覆盖。同步器可能使旗标保守地延迟撤销，
+这是硬件两拍跨域语义的一部分。
+
+同刻事件保持“双方采样旧寄存器”：同刻写读均使用旧 `full/empty` 和旧二级同步值
+决定接受；同步器输入级采样对边沿前的旧格雷。数据面只按地址读出，不参与旗标计算。
 
 ### `EdgeRecord`（每步轨迹，字段即文档）
 
@@ -113,6 +171,9 @@ w2r_before/after, wdata, rdata`。
   长程回绕（k=1 与 k=5）逐寄存器差分。
 - **抽象队列核对**：另用 `collections.deque` 仅核对“已接受数据”的 FIFO
   顺序与占用恒在 `[0, 深度]`（防越界），它不参与被测旗标逻辑。
+- **双逻辑队列核对**：`tests/test_dual_reader.py` 为每条接受写入放入两条独立
+  `deque`，核对任意时钟交错、停钟、同刻和回绕下两个读端各消费一次；同时用
+  世代前向距离逐步检查接受写不会越过任何读者仍需要的槽。
 - 格雷 `gray_to_binary(binary_to_gray(v)) == v` 仅作补充往返检查。
 
 ## 浮点与误差口径
@@ -136,6 +197,9 @@ w2r_before/after, wdata, rdata`。
 - 只实现本题契约的**有限子集**：k=1..5、离散整数时间、单一二进制反射
   格雷与两级同步；**不宣称兼容任何行业标准总线/FIFO 规范**，不建模
   亚稳态概率、复位释放同步、时序约束或真实 FPGA 原语。
-- 不做几乎满/几乎空（almost-full/empty）、分组计数、数据校验（ECC/
-  parity）、多写多读端口。
+- 双读端模型是固定一写两读订阅：共同复位、无运行中取消订阅；不做几乎满/
+  几乎空（almost-full/empty）、分组计数、数据校验（ECC/parity）、多写端或
+  可动态增删的多读者端口。
+- 读端只按自己的读指针和 `empty` 寄存器观察同一份按地址存储的数据；模型不
+  模拟广播总线、复制缓存、数据老化或读后清除。
 - 不提供网站、通用 CLI、看板或持久化；终端命令仅用于测试与演示。
