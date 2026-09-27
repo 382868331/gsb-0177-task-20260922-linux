@@ -1,37 +1,54 @@
 # afifo — FPGA 异步 FIFO 指针跨域检查模块
 
-离散事件的异步 FIFO 指针/旗标硬件模型，用于离线数字硬件验证。仅用 Python
-标准库从零实现，核心算法不依赖、不调用任何第三方 FIFO 实现。
+离散事件的异步 FIFO 指针/旗标硬件模型，用于离线数字硬件验证。基线的单写/
+单读能力完整保留；本次新增一个写端、两个独立读时钟端模型：每条写入都必须
+由读端 0 和读端 1 分别消费一次，慢读端决定槽位何时可回收。仅用 Python
+标准库从零实现，不依赖、不调用任何第三方 FIFO 实现。
 
-## 环境与依赖
+## 环境与隔离 venv
 
 - Python **3.14.7**（Linux 原生验证；不使用 3.14 之外的语法特性时亦可在
   较早的 3.x 上运行，但以 3.14.7 为准）。
 - **无第三方依赖**，无需安装任何包；离线运行，不访问网络、硬件、数据库或
   云服务。
 
+推荐使用隔离 venv，避免污染系统 Python：
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python --version            # 预期为 Python 3.14.7
+python -m unittest discover -s tests -v
+python demo_iteration.py
+```
+
+不需要执行 `pip install -r requirements.txt`；仓库只使用标准库。`deactivate`
+可退出隔离环境。
+
 ## 准确命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（28 个用例）
-python demo.py                            # 固定输入演示，实时计算
+python -m unittest discover -s tests -v   # 基线回归 + 双读端测试（40 个用例）
+python demo_iteration.py                  # 双读端固定输入演示，实时计算
+python demo.py                            # 基线单读端演示（保留）
 ```
 
-`demo.py` 为固定字面值调度（无随机、无 `sleep`、无预录输出），在本机实测
-远小于 8 秒（约 0.03 秒），打印一段正常工作轨迹、一段指针回绕轨迹，以及
-真实触发的硬件拒绝与契约异常。
+两个演示均为固定调度、实时计算：无随机、无 `sleep`、无账号/密钥、无预录
+结果。当前环境实测二者均在 1 秒内结束，满足双读端演示不超过 90 秒的要求。
 
 ## 包结构与公开接口
 
 ```
 afifo/
   __init__.py
-  gray.py     # binary_to_gray / gray_to_binary
-  model.py    # AsyncFIFO, Event, EdgeRecord, AsyncFIFOError
+  gray.py     # binary_to_gray / gray_to_binary / forward_distance
+  model.py    # 单读端 AsyncFIFO + 双读端 DualAsyncFIFO
 tests/
   reference_model.py  # 独立参考（不 import afifo）+ 抽象队列核对
   test_afifo.py
-demo.py
+  test_dual_afifo.py
+  demo.py
+  demo_iteration.py
 ```
 
 ### `AsyncFIFO(k)`
@@ -66,6 +83,51 @@ w2r_before/after, wdata, rdata`。
 - `r2w`/`w2r` 为 `(一级同步, 二级同步)` 格雷元组；`before` 是边沿采样的
   旧寄存器值。
 
+### `DualAsyncFIFO(k)`
+
+新增的一写两读模型，与旧单读端并存：
+
+```python
+from afifo import DualAsyncFIFO, DualEvent
+
+fifo = DualAsyncFIFO(k=2)
+record = fifo.run_one(DualEvent(
+    1, wclk=True, rclk0=False, rclk1=False,
+    wen=True, ren0=False, ren1=False, wdata="D0",
+))
+```
+
+- 两个读端有独立时钟、使能、读指针、empty 寄存器和写指针同步器。
+- 共同 `reset()`；不提供、也不允许运行中取消订阅。两个消费者从复位到
+  结束始终存在，因此写端必须保留任一读端尚未消费的条目。
+- 属性：`rptrs`、`empties`、`accepted_reads`、`release_ptr`、
+  `synced_release_ptr`、`steps`；`full` 仍为写端寄存器。
+- `release_ptr` 是实际慢读端指针；`synced_release_ptr` 是写端经两路两级
+  同步后保守可见的慢读端指针。
+
+### `DualEvent` 与 `DualEdgeRecord`
+
+`DualEvent(time, wclk, rclk0, rclk1, wen=False, ren0=False, ren1=False,
+wdata=None)` 的三个时钟不得全停；载荷契约与单读端一致。
+
+`DualEdgeRecord` 以二元组表示两个读端：`rclks`、`rens`、`r_accepts`、
+`rptrs_before/after`、`rgrays_before/after`、`empties_before/after`、
+`rdatas`。每个读端各有自己的 `r2w[i]`；写域到每个读端各有 `w2r[i]`。
+
+### 回绕世代与占用距离
+
+不能对 `k+1` 位回绕指针做普通无符号 `min`。公开辅助函数
+`forward_distance(later, earlier, k)` 计算带世代的前向距离：
+
+```text
+distance = (later - earlier) mod 2**(k+1)
+```
+
+合法占用距离在 `0..2**k`。双读端写满判断分别计算写指针相对两路**已同步**
+读指针的前向距离，任一路达到深度都置 `full`；因此读得快的一路不会替停钟
+或落后的另一路释放存储槽。每个读端的 empty 仍比较本地下一读指针与同步到
+该读域的写指针世代位置。
+
 ### 错误语义
 
 - 所有契约错误抛 `afifo.AsyncFIFOError`（`ValueError` 子类），消息包含
@@ -92,6 +154,14 @@ w2r_before/after, wdata, rdata`。
    长度；存储器按 k 位地址读写，仅用于数据面与读出核对。因此旗标天然
    保守：跨域两级延迟期间可能出现“非满报满 / 非空报空”，造成合法请求被
    拒绝——`demo.py` 的 t=8..15、t=21..22 与 t=2..4 明确展示该延迟。
+7. `DualAsyncFIFO` 中，写端为每个读端维护独立的读指针两级同步；写接受
+   仍只看写域旧 `full`。该旗标在写沿按下一写指针与两路旧二级同步读指针
+   的世代距离更新，任一路距离达到深度即满。
+8. 每个读端沿各自独立更新自己的指针和 empty；一路停钟只冻结该路及其在
+   写端对应同步链的可见进展，不影响另一路读取已存在数据。停钟路尚未消费
+   的槽位不能被覆盖，写端最终必须背压。
+9. 三个时钟同刻或任意子集同刻时，所有同步器输入级仍采样对端边沿前旧
+   Gray；本沿新指针只可能在后续边沿被看到。
 
 ## 输入上限汇总
 
@@ -111,8 +181,12 @@ w2r_before/after, wdata, rdata`。
 - **独立参考差分**：`tests/reference_model.py` 不导入 `afifo`，独立重述
   格雷公式与全部时序；对 k=1..5、9 种时钟频比（含同刻）、停钟窗口、
   长程回绕（k=1 与 k=5）逐寄存器差分。
-- **抽象队列核对**：另用 `collections.deque` 仅核对“已接受数据”的 FIFO
-  顺序与占用恒在 `[0, 深度]`（防越界），它不参与被测旗标逻辑。
+- **双读端独立参考差分**：`RefDualFIFO` 不导入 `afifo`，覆盖两路独立时钟
+  频比、三路同刻、一路长期停钟、写端背压与多轮回绕。
+- **抽象队列核对**：另用 `collections.deque` 维护单读端一条、双读端两条
+  独立逻辑队列，逐条核对每条数据被每个读端按序消费一次；每次存储器地址
+  被再次写入前，检查该槽上一条数据已在两个消费集合中，防止覆盖任一读端
+  仍需要的数据。
 - 格雷 `gray_to_binary(binary_to_gray(v)) == v` 仅作补充往返检查。
 
 ## 浮点与误差口径
@@ -124,7 +198,8 @@ w2r_before/after, wdata, rdata`。
 ## 设计取舍
 
 - 事件时间用整数轴（不模拟物理亚稳态与具体相位）：同一时刻可给出
-  wclk/rclk 双沿，语义统一定义为“双方采样旧寄存器”，确定可复现。
+  wclk/rclk 双沿；双读端可给出 wclk/rclk0/rclk1 的任意同刻子集，语义统一
+  定义为“各方采样旧寄存器”，确定可复现。
 - 格雷跨域只建模“合法但可能滞后一到两拍”的值，不建模亚稳态采样窗口。
 - 数据面用按地址索引的列表，纯粹为演示读出数据顺序；旗标逻辑结构上不
   接触它（有测试扫描源码保证）。
@@ -136,6 +211,8 @@ w2r_before/after, wdata, rdata`。
 - 只实现本题契约的**有限子集**：k=1..5、离散整数时间、单一二进制反射
   格雷与两级同步；**不宣称兼容任何行业标准总线/FIFO 规范**，不建模
   亚稳态概率、复位释放同步、时序约束或真实 FPGA 原语。
+- 双读端模型固定为**一个写端、两个永久订阅的读端**；不支持运行中加入/
+  取消订阅、两个以上读端、多写端或端口数参数化。
 - 不做几乎满/几乎空（almost-full/empty）、分组计数、数据校验（ECC/
-  parity）、多写多读端口。
+  parity）。
 - 不提供网站、通用 CLI、看板或持久化；终端命令仅用于测试与演示。

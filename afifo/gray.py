@@ -35,3 +35,25 @@ def gray_to_binary(gray: int) -> int:
         bits >>= 1
         gray ^= bits
     return gray
+
+
+def forward_distance(later: int, earlier: int, k: int) -> int:
+    """Generation-aware forward distance between two wrapping FIFO pointers.
+
+    ``later`` and ``earlier`` are ``k+1``-bit binary pointers.  The extra
+    high bit is the generation/wrap bit, so distance is measured forward on
+    the modulo-``2**(k+1)`` pointer circle rather than by ordinary unsigned
+    subtraction or ``min``.  A valid FIFO distance is in ``0..2**k``.
+    """
+    if not isinstance(k, int) or isinstance(k, bool):
+        raise TypeError(f"k must be an int, got {type(k).__name__}")
+    if not 1 <= k <= 5:
+        raise ValueError(f"k must be within [1, 5], got {k}")
+    for name, value in (("later", later), ("earlier", earlier)):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(
+                f"{name} must be an int, got {type(value).__name__}"
+            )
+        if not 0 <= value <= (1 << (k + 1)) - 1:
+            raise ValueError(f"{name} must be a {k + 1}-bit pointer")
+    return (later - earlier) & ((1 << (k + 1)) - 1)
