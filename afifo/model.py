@@ -10,13 +10,16 @@ Timing model (one :class:`Event` = one point on an integer time axis)
   ``s2`` output.  When a read and a write edge coincide, *both* sides sample
   the register values as they were before that time step -- including the
   input stage of each synchronizer.
-* ``full`` is a write-domain register (reset ``False``); ``empty`` is a
-  read-domain register (reset ``True``).  On a clock edge the old flag
-  decides whether the enable is accepted; afterwards the flag is recomputed
-  from the local *next* pointer Gray and the *old* synchronized value:
+* ``full`` and ``almost_full`` are write-domain registers; ``empty`` and
+  ``almost_empty`` are read-domain registers.  Reset values are ``False``
+  for full and ``True`` for empty; warning reset values follow thresholds.
+  The old full/empty flags decide acceptance; flags then use the local
+  *next* pointer and the *old* synchronized value:
 
       empty_next = gray(rptr_next) == w2r_s2_old
       full_next  = gray(wptr_next) == (r2w_s2_old ^ TOP_TWO_BITS)
+
+Early flags count only entries provable through old stage-two synchronizers.
 
 * A write is accepted iff ``wclk and wen and not full_old``; a read is
   accepted iff ``rclk and ren and not empty_old``.  Acceptance never consults
@@ -29,7 +32,7 @@ that domain, synchronizers included.
 import math
 from typing import Any, NamedTuple, Optional
 
-from .gray import binary_to_gray
+from .gray import binary_to_gray, gray_to_binary
 
 __all__ = ["AsyncFIFO", "AsyncFIFOError", "Event", "EdgeRecord"]
 
@@ -170,6 +173,10 @@ class EdgeRecord(NamedTuple):
     w2r_after: tuple
     wdata: Any
     rdata: Any
+    almost_full_before: bool
+    almost_full_after: bool
+    almost_empty_before: bool
+    almost_empty_after: bool
 
 
 class AsyncFIFO:
@@ -177,13 +184,21 @@ class AsyncFIFO:
 
     Parameters
         k: log2 depth; ``k in {1, 2, 3, 4, 5}`` (depth 2..32).
+        almost_full_threshold: assert when guaranteed free entries <= value.
+        almost_empty_threshold: assert when readable entries <= value.
 
     Usage
         >>> fifo = AsyncFIFO(k=3)
         >>> records = fifo.run([Event(0, True, False, wen=True, wdata=10)])
     """
 
-    def __init__(self, k: int) -> None:
+    def __init__(
+        self,
+        k: int,
+        *,
+        almost_full_threshold: int = 1,
+        almost_empty_threshold: int = 1,
+    ) -> None:
         self._k = _strict_int(k, "k", lo=1, hi=5)
         self._depth = 1 << k
         self._width = k + 1
@@ -191,6 +206,18 @@ class AsyncFIFO:
         self._addr_mask = self._depth - 1
         # Flip the top two pointer bits to test the full condition.
         self._full_mask = 0b11 << (k - 1)
+        self._almost_full_threshold = _strict_int(
+            almost_full_threshold,
+            "almost_full_threshold",
+            lo=0,
+            hi=self._depth,
+        )
+        self._almost_empty_threshold = _strict_int(
+            almost_empty_threshold,
+            "almost_empty_threshold",
+            lo=0,
+            hi=self._depth,
+        )
         self.reset()
 
     def reset(self) -> None:
@@ -199,6 +226,8 @@ class AsyncFIFO:
         self._rptr = 0
         self._full = False
         self._empty = True
+        self._almost_full = self._depth <= self._almost_full_threshold
+        self._almost_empty = 0 <= self._almost_empty_threshold
         self._r2w_s1 = 0  # synchronized read Gray, stage 1 (write domain)
         self._r2w_s2 = 0  # synchronized read Gray, stage 2 (write domain)
         self._w2r_s1 = 0  # synchronized write Gray, stage 1 (read domain)
@@ -224,9 +253,27 @@ class AsyncFIFO:
         return self._full
 
     @property
+    def almost_full(self) -> bool:
+        """Current write-domain guaranteed-free-space warning."""
+        return self._almost_full
+
+    @property
     def empty(self) -> bool:
         """Current read-domain empty flag (register output)."""
         return self._empty
+
+    @property
+    def almost_empty(self) -> bool:
+        """Current read-domain guaranteed-readable-entry warning."""
+        return self._almost_empty
+
+    @property
+    def almost_full_threshold(self) -> int:
+        return self._almost_full_threshold
+
+    @property
+    def almost_empty_threshold(self) -> int:
+        return self._almost_empty_threshold
 
     @property
     def wptr(self) -> int:
@@ -257,7 +304,11 @@ class AsyncFIFO:
             "wgray": binary_to_gray(self._wptr),
             "rgray": binary_to_gray(self._rptr),
             "full": self._full,
+            "almost_full": self._almost_full,
             "empty": self._empty,
+            "almost_empty": self._almost_empty,
+            "almost_full_threshold": self._almost_full_threshold,
+            "almost_empty_threshold": self._almost_empty_threshold,
             "r2w": (self._r2w_s1, self._r2w_s2),
             "w2r": (self._w2r_s1, self._w2r_s2),
             "last_time": self._last_time,
@@ -319,7 +370,8 @@ class AsyncFIFO:
     def _step(self, event: Event) -> EdgeRecord:
         # ---- old state, sampled by both edges at this (possibly common) time
         wptr_o, rptr_o = self._wptr, self._rptr
-        full_o, empty_o = self._full, self._empty
+        full_o, almost_full_o = self._full, self._almost_full
+        empty_o, almost_empty_o = self._empty, self._almost_empty
         r2w_s1_o, r2w_s2_o = self._r2w_s1, self._r2w_s2
         w2r_s1_o, w2r_s2_o = self._w2r_s1, self._w2r_s2
         wgray_o = binary_to_gray(wptr_o)
@@ -345,11 +397,24 @@ class AsyncFIFO:
 
         # ---- flags: local next-pointer Gray vs OLD synchronizer output
         full_n = full_o
+        almost_full_n = almost_full_o
         if event.wclk:
             full_n = wgray_n == (r2w_s2_o ^ self._full_mask)
+            rptr_safe = gray_to_binary(r2w_s2_o)
+            filled_upper_bound = (wptr_n - rptr_safe) & self._mask
+            guaranteed_free = self._depth - filled_upper_bound
+            almost_full_n = (
+                guaranteed_free <= self._almost_full_threshold
+            )
         empty_n = empty_o
+        almost_empty_n = almost_empty_o
         if event.rclk:
             empty_n = rgray_n == w2r_s2_o
+            wptr_safe = gray_to_binary(w2r_s2_o)
+            guaranteed_entries = (wptr_safe - rptr_n) & self._mask
+            almost_empty_n = (
+                guaranteed_entries <= self._almost_empty_threshold
+            )
 
         # ---- two-stage synchronizers; input stage samples the OLD Gray
         if event.wclk:
@@ -363,7 +428,10 @@ class AsyncFIFO:
 
         # ---- commit
         self._wptr, self._rptr = wptr_n, rptr_n
-        self._full, self._empty = full_n, empty_n
+        self._full = full_n
+        self._almost_full = almost_full_n
+        self._empty = empty_n
+        self._almost_empty = almost_empty_n
         self._r2w_s1, self._r2w_s2 = r2w_s1_n, r2w_s2_n
         self._w2r_s1, self._w2r_s2 = w2r_s1_n, w2r_s2_n
         self._last_time = event.time
@@ -394,6 +462,10 @@ class AsyncFIFO:
             w2r_after=(w2r_s1_n, w2r_s2_n),
             wdata=event.wdata,
             rdata=rdata,
+            almost_full_before=almost_full_o,
+            almost_full_after=almost_full_n,
+            almost_empty_before=almost_empty_o,
+            almost_empty_after=almost_empty_n,
         )
         self._steps.append(record)
         return record

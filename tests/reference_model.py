@@ -15,15 +15,33 @@ def ref_gray(binary: int) -> int:
     return binary ^ (binary >> 1)
 
 
+def ref_gray_to_binary(gray: int) -> int:
+    """Independent inverse of ``ref_gray`` for non-negative Gray codes."""
+    value = gray
+    bit = gray >> 1
+    while bit:
+        value ^= bit
+        bit >>= 1
+    return value
+
+
 class RefFIFO:
     """Hand-written reference mirroring the contracted hardware semantics."""
 
-    def __init__(self, k: int) -> None:
+    def __init__(
+        self,
+        k: int,
+        *,
+        almost_full_threshold: int = 1,
+        almost_empty_threshold: int = 1,
+    ) -> None:
         assert 1 <= k <= 5
         self.k = k
         self.depth = 1 << k
         self.mask = (1 << (k + 1)) - 1
         self.full_mask = 0b11 << (k - 1)
+        self.almost_full_threshold = almost_full_threshold
+        self.almost_empty_threshold = almost_empty_threshold
         # monotonic accepted-access counters (wrap-free occupancy measure)
         self.n_w = 0
         self.n_r = 0
@@ -34,13 +52,18 @@ class RefFIFO:
         self.rptr = 0
         self.full = False
         self.empty = True
+        self.almost_full = (
+            self.depth <= self.almost_full_threshold
+        )
+        self.almost_empty = 0 <= self.almost_empty_threshold
         self.r2w = [0, 0]  # synchronized read Gray, stages 1/2, write domain
         self.w2r = [0, 0]  # synchronized write Gray, stages 1/2, read domain
         self.queue = deque()  # abstract data queue (ordering oracle only)
 
     def step(self, wclk, rclk, wen, ren, wdata=None):
         w_o, r_o = self.wptr, self.rptr
-        full_o, empty_o = self.full, self.empty
+        full_o, almost_full_o = self.full, self.almost_full
+        empty_o, almost_empty_o = self.empty, self.almost_empty
         r2w_1_o, r2w_2_o = self.r2w
         w2r_1_o, w2r_2_o = self.w2r
 
@@ -63,9 +86,19 @@ class RefFIFO:
 
         if wclk:
             self.full = ref_gray(w_n) == (r2w_2_o ^ self.full_mask)
+            r_safe = ref_gray_to_binary(r2w_2_o)
+            guaranteed_free = self.depth - ((w_n - r_safe) & self.mask)
+            self.almost_full = (
+                guaranteed_free <= self.almost_full_threshold
+            )
             self.r2w = [ref_gray(r_o), r2w_1_o]  # samples OLD read Gray
         if rclk:
             self.empty = ref_gray(r_n) == w2r_2_o
+            w_safe = ref_gray_to_binary(w2r_2_o)
+            guaranteed_entries = (w_safe - r_n) & self.mask
+            self.almost_empty = (
+                guaranteed_entries <= self.almost_empty_threshold
+            )
             self.w2r = [ref_gray(w_o), w2r_1_o]  # samples OLD write Gray
 
         self.wptr, self.rptr = w_n, r_n
@@ -77,7 +110,9 @@ class RefFIFO:
             "wgray": ref_gray(w_n),
             "rgray": ref_gray(r_n),
             "full": self.full,
+            "almost_full": self.almost_full,
             "empty": self.empty,
+            "almost_empty": self.almost_empty,
             "r2w": tuple(self.r2w),
             "w2r": tuple(self.w2r),
             "occupancy": len(self.queue),

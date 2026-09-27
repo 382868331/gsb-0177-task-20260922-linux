@@ -176,6 +176,45 @@ def section_wrap():
     assert fifo.accepted_writes - fifo.accepted_reads == len(q)
 
 
+def section_almost_flags():
+    print("\n" + "=" * 106)
+    print("快满/快空：k=2，深度4，AF=剩余可保证空位<=2，AE=可保证可读项<=0")
+    print("=" * 106)
+    fifo = AsyncFIFO(
+        k=2,
+        almost_full_threshold=2,
+        almost_empty_threshold=0,
+    )
+    print(
+        "  复位态: "
+        f"almost_full={int(fifo.almost_full)} "
+        f"almost_empty={int(fifo.almost_empty)}"
+    )
+    for t in (1, 2):
+        rec = fifo.run_one(Event(t, True, False, wen=True, wdata=f"E{t}"))
+        print(
+            f"  t={t} 写后: AF={int(rec.almost_full_after)} "
+            f"F={int(rec.full_after)}；该写域只相信旧 r2w_s2"
+        )
+    assert not fifo.steps[0].almost_full_after
+    assert fifo.steps[1].almost_full_after
+    assert not fifo.steps[1].full_after
+
+    first = fifo.run_one(Event(3, False, True))
+    second = fifo.run_one(Event(4, False, True))
+    third = fifo.run_one(Event(5, False, True))
+    print(
+        "  读域同步写指针："
+        f"t=3 AE={int(first.almost_empty_after)}，"
+        f"t=4 AE={int(second.almost_empty_after)}，"
+        f"t=5 AE={int(third.almost_empty_after)}"
+    )
+    assert first.almost_empty_after
+    assert second.almost_empty_after
+    assert not third.almost_empty_after
+    print("  AF 比 full 提前一个写沿给出；AE 必须等写格雷穿过两级同步器后才撤销")
+
+
 def section_boundary():
     print("\n" + "=" * 106)
     print("实际触发的拒绝/异常边界（模型真实抛出并就地捕获，非预录文本）")
@@ -207,6 +246,8 @@ def section_boundary():
     for desc, call in [
         ("k=6 越出 1..5", lambda: AsyncFIFO(k=6)),
         ("k=True 布尔冒充整数", lambda: AsyncFIFO(k=True)),
+        ("AF阈值=-1", lambda: AsyncFIFO(k=2, almost_full_threshold=-1)),
+        ("AE阈值超过深度", lambda: AsyncFIFO(k=2, almost_empty_threshold=5)),
         ("NaN 浮点载荷", lambda: Event(1, True, False, wen=True,
                                        wdata=float("nan"))),
         ("Infinity 浮点载荷", lambda: Event(1, True, False, wen=True,
@@ -240,6 +281,7 @@ def section_boundary():
 def main():
     section_normal()
     section_wrap()
+    section_almost_flags()
     section_boundary()
     print("\n演示完成：以上数值均由模型实时计算；抽象队列独立核对全部通过。")
 

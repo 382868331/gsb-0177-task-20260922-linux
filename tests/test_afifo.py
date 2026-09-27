@@ -193,16 +193,115 @@ class TestStoppedClock(unittest.TestCase):
             self.assertEqual(rec.w2r_after, snap["w2r"])
 
 
+class TestAlmostFlags(unittest.TestCase):
+    def test_threshold_reset_and_early_write_warning(self):
+        immediate = AsyncFIFO(
+            k=2,
+            almost_full_threshold=4,
+            almost_empty_threshold=0,
+        )
+        self.assertTrue(immediate.almost_full)
+        self.assertTrue(immediate.almost_empty)
+        no_full_warning = AsyncFIFO(k=2, almost_full_threshold=0)
+        self.assertFalse(no_full_warning.almost_full)
+        self.assertTrue(no_full_warning.almost_empty)
+
+        fifo = AsyncFIFO(k=2, almost_full_threshold=2)
+        self.assertFalse(fifo.almost_full)
+        first = fifo.run_one(Event(1, True, False, wen=True, wdata=1))
+        self.assertFalse(first.almost_full_after)
+        second = fifo.run_one(Event(2, True, False, wen=True, wdata=2))
+        self.assertTrue(second.almost_full_after)
+        self.assertFalse(second.full_after)
+
+    def test_almost_empty_waits_for_two_synchronizer_edges(self):
+        fifo = AsyncFIFO(k=2, almost_empty_threshold=0)
+        fifo.run_one(Event(1, True, False, wen=True, wdata="x"))
+        first = fifo.run_one(Event(2, False, True))
+        second = fifo.run_one(Event(3, False, True))
+        self.assertTrue(first.almost_empty_after)
+        self.assertTrue(second.almost_empty_after)
+        rec = fifo.run_one(Event(4, False, True))
+        self.assertFalse(rec.almost_empty_after)
+
+    def test_warning_flags_freeze_with_their_clock(self):
+        fifo = AsyncFIFO(k=2, almost_full_threshold=4, almost_empty_threshold=0)
+        fifo.run([
+            Event(1, True, False, wen=True, wdata=1),
+            Event(2, True, False, wen=True, wdata=2),
+        ])
+        for t in (3, 4, 5):
+            rec = fifo.run_one(Event(t, False, True))
+            self.assertTrue(rec.almost_full_before)
+            self.assertTrue(rec.almost_full_after)
+        self.assertFalse(fifo.almost_empty)
+        for t in (6, 7, 8):
+            rec = fifo.run_one(Event(t, True, False))
+            self.assertFalse(rec.almost_empty_before)
+            self.assertFalse(rec.almost_empty_after)
+
+    def test_wrap_and_simultaneous_access_preserve_conservative_warnings(self):
+        k = 2
+        fifo = AsyncFIFO(k, almost_full_threshold=1, almost_empty_threshold=1)
+        occupancy = 0
+        for t in range(1, 80):
+            wen = not fifo.full and (t % 4 != 0)
+            ren = not fifo.empty and (t % 3 == 0)
+            rec = fifo.run_one(Event(
+                t,
+                True,
+                True,
+                wen=wen,
+                ren=ren,
+                wdata=f"d{t}" if wen else None,
+            ))
+            if rec.w_accept:
+                occupancy += 1
+            if rec.r_accept:
+                occupancy -= 1
+            if not rec.almost_full_after:
+                self.assertGreater(4 - occupancy, 1)
+            if not rec.almost_empty_after:
+                self.assertGreaterEqual(occupancy, 2)
+
+    def test_threshold_contract(self):
+        for bad in (-1, 5, True, 1.0, "2"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(AsyncFIFOError):
+                    AsyncFIFO(2, almost_full_threshold=bad)
+                with self.assertRaises(AsyncFIFOError):
+                    AsyncFIFO(2, almost_empty_threshold=bad)
+
+
 class TestDifferentialAgainstIndependentModel(unittest.TestCase):
     """Compare every register against RefFIFO over deterministic schedules."""
 
-    def _diff_run(self, k, wp, rp, n, seed=1, w_stops=(), r_stops=()):
+    def _diff_run(
+        self,
+        k,
+        wp,
+        rp,
+        n,
+        seed=1,
+        w_stops=(),
+        r_stops=(),
+        af_threshold=1,
+        ae_threshold=1,
+    ):
         schedule = make_schedule(
             k, n, w_period=wp, r_period=rp, seed=seed,
             stop_windows=w_stops, r_stop_windows=r_stops,
         )
-        dut = AsyncFIFO(k=k)
-        ref = RefFIFO(k=k)
+        dut = AsyncFIFO(
+            k,
+            almost_full_threshold=af_threshold,
+            almost_empty_threshold=ae_threshold,
+        )
+        ref = RefFIFO(
+            k,
+            almost_full_threshold=af_threshold,
+            almost_empty_threshold=ae_threshold,
+        )
         events = [Event(t, wc, rc, we, re_, data)
                   for (t, wc, rc, we, re_, data) in schedule]
         records = dut.run(events)
@@ -219,7 +318,9 @@ class TestDifferentialAgainstIndependentModel(unittest.TestCase):
                 self.assertEqual(rec.wgray_after, exp["wgray"])
                 self.assertEqual(rec.rgray_after, exp["rgray"])
                 self.assertIs(rec.full_after, exp["full"])
+                self.assertIs(rec.almost_full_after, exp["almost_full"])
                 self.assertIs(rec.empty_after, exp["empty"])
+                self.assertIs(rec.almost_empty_after, exp["almost_empty"])
                 self.assertEqual(rec.r2w_after, exp["r2w"])
                 self.assertEqual(rec.w2r_after, exp["w2r"])
                 self.assertEqual(rec.rdata, exp["rdata"])
@@ -255,6 +356,20 @@ class TestDifferentialAgainstIndependentModel(unittest.TestCase):
         self._diff_run(1, 1, 1, 400, seed=42)
         # k=5 (depth 32) needs 64 accepts per wrap; long run covers it.
         self._diff_run(5, 2, 3, 4000, seed=77)
+
+    def test_almost_flag_thresholds(self):
+        for k in (1, 2, 5):
+            cases = (0, 0), (1, 1), (1 << k, 1 << k), (1, min(3, 1 << k))
+            for af, ae in cases:
+                self._diff_run(
+                    k,
+                    2,
+                    3,
+                    500,
+                    seed=1000 + k * 17 + af * 5 + ae,
+                    af_threshold=af,
+                    ae_threshold=ae,
+                )
 
 
 class TestSafetyInvariants(unittest.TestCase):
