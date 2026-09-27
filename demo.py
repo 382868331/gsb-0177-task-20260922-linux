@@ -35,6 +35,7 @@ def print_row(rec, width):
         f"rptr={b(rec.rptr_after, width)} "
         f"wg={b(rec.wgray_after, width)} rg={b(rec.rgray_after, width)} "
         f"| F={int(rec.full_after)} E={int(rec.empty_after)} "
+        f"AF={int(rec.almost_full_after)} AE={int(rec.almost_empty_after)} "
         f"r2w={fmt_sync(rec.r2w_after)} w2r={fmt_sync(rec.w2r_after)} "
         f"| in={data!s:<4} out={out!s}"
     )
@@ -87,11 +88,13 @@ NORMAL_SCHEDULE = [
 
 def section_normal():
     print("=" * 106)
-    print("正常结果：k=2，深度 4，指针 3 位。固定字面值调度，展示两级同步与保守 full/empty 延迟")
+    print("正常结果：k=2，深度 4，指针 3 位，快满/快空余量阈值均=1。")
+    print("固定字面值调度，展示两级同步、保守 full/empty 延迟及提前的快满/快空提示")
     print("=" * 106)
     k = 2
-    fifo = AsyncFIFO(k=k)
-    print(f"复位态: full={fifo.full} empty={fifo.empty} wptr=0 rptr=0 "
+    fifo = AsyncFIFO(k=k, almost_full_margin=1, almost_empty_margin=1)
+    print(f"复位态: full={fifo.full} empty={fifo.empty} "
+          f"almost_full={int(fifo.almost_full)} almost_empty={int(fifo.almost_empty)} "
           f"r2w=(0,0) w2r=(0,0)\n")
 
     events = [Event(t, bool(w), bool(r), bool(we), bool(re_), d)
@@ -130,6 +133,15 @@ def section_normal():
     print("\n保守满旗标延迟：")
     print(f"  full 首次在 t={full_on.time} 置位；被拒写发生在 "
           f"t={rejected_writes}（含占用远低于深度时的保守误置位）")
+
+    af_on = next(r for r in records if r.wclk and r.almost_full_after)
+    ae_on = next(r for r in records if r.rclk and r.almost_empty_after)
+    assert af_on.time <= full_on.time
+    print("\n快满/快空提前提示（阈值由使用者设置；判据只依赖本域指针与同步寄存器）：")
+    print(f"  快满(almost_full, 保证余量<=1)最早 t={af_on.time} 置位，"
+          f"不晚于首次真满 t={full_on.time}；快空最早 t={ae_on.time}")
+    print("  快满用最旧同步读指针 s2 给出占用上界（保证可用空间不被高估）；"
+          "快空用最新同步写指针 s1 给出占用下界（保证可读条目不被高估）")
 
     both = [r for r in records if r.w_accept and r.r_accept]
     print("\n同刻边沿（两级同步器输入级锁存的是对端“旧”格雷）：")
@@ -207,6 +219,10 @@ def section_boundary():
     for desc, call in [
         ("k=6 越出 1..5", lambda: AsyncFIFO(k=6)),
         ("k=True 布尔冒充整数", lambda: AsyncFIFO(k=True)),
+        ("快满余量越界(depth+1)",
+         lambda: AsyncFIFO(k=1, almost_full_margin=3)),
+        ("快空阈值为布尔",
+         lambda: AsyncFIFO(k=1, almost_empty_margin=True)),
         ("NaN 浮点载荷", lambda: Event(1, True, False, wen=True,
                                        wdata=float("nan"))),
         ("Infinity 浮点载荷", lambda: Event(1, True, False, wen=True,

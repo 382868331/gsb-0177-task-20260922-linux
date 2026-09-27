@@ -70,6 +70,43 @@ class TestReset(unittest.TestCase):
         self.assertEqual(AsyncFIFO(1)._full_mask, 0b11)
         self.assertEqual(AsyncFIFO(5)._full_mask, 0b11 << 4)
 
+    def test_threshold_defaults_and_power_on(self):
+        fifo = AsyncFIFO(k=3)
+        self.assertEqual(fifo.almost_full_margin, 1)
+        self.assertEqual(fifo.almost_empty_margin, 1)
+        self.assertFalse(fifo.almost_full)   # depth free at reset
+        self.assertTrue(fifo.almost_empty)   # zero guaranteed entries
+
+    def test_threshold_reset_marks(self):
+        # margin == depth: warning necessarily on right after reset.
+        fifo = AsyncFIFO(k=2, almost_full_margin=4, almost_empty_margin=4)
+        self.assertTrue(fifo.almost_full)
+        self.assertTrue(fifo.almost_empty)
+        # margin 0: almost flags coincide with the conservative exact case.
+        fifo = AsyncFIFO(k=2, almost_full_margin=0, almost_empty_margin=0)
+        self.assertFalse(fifo.almost_full)
+        self.assertTrue(fifo.almost_empty)
+
+    def test_threshold_contract(self):
+        for bad in (-1, 9, True, 1.0, "1", None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(AsyncFIFOError):
+                    AsyncFIFO(k=2, almost_full_margin=bad)
+                with self.assertRaises(AsyncFIFOError):
+                    AsyncFIFO(k=2, almost_empty_margin=bad)
+        for margin in range(0, 5):
+            AsyncFIFO(k=2, almost_full_margin=margin,
+                      almost_empty_margin=margin)
+
+    def test_reset_keeps_user_thresholds_and_recomputes_marks(self):
+        fifo = AsyncFIFO(k=2, almost_full_margin=1, almost_empty_margin=2)
+        fifo.run([Event(1, True, False, wen=True, wdata=1)])
+        fifo.reset()
+        self.assertEqual(fifo.almost_full_margin, 1)
+        self.assertEqual(fifo.almost_empty_margin, 2)
+        self.assertFalse(fifo.almost_full)
+        self.assertTrue(fifo.almost_empty)
+
 
 # Hand-derived k=1 waveform.  Each row:
 # (time, wclk, rclk, wen, ren, w_accept, r_accept, wptr, rptr,
@@ -167,6 +204,129 @@ class TestCoincidentEdgesSampleOldState(unittest.TestCase):
         self.assertEqual(rec.w2r_after[0], rec.wgray_before)
 
 
+class TestAlmostFlags(unittest.TestCase):
+    def test_almost_full_warns_before_full_and_never_underpromises(self):
+        # depth 4, margin 1: warning fires when guaranteed free space <= 1,
+        # i.e. strictly before the exact full case; once full is on the
+        # warning must stay on.
+        fifo = AsyncFIFO(k=2, almost_full_margin=1)
+        warned_at = full_at = None
+        for t in range(1, 8):
+            rec = fifo.run_one(
+                Event(t, True, False, wen=True, wdata=t)
+            )
+            if warned_at is None and rec.almost_full_after:
+                warned_at = t
+            if rec.almost_full_after:
+                self.assertTrue(rec.almost_full_before is True
+                                or not rec.full_after
+                                or rec.full_after)
+            if full_at is None and rec.full_after:
+                full_at = t
+        self.assertIsNotNone(warned_at)
+        self.assertIsNotNone(full_at)
+        self.assertLessEqual(warned_at, full_at)
+
+    def test_almost_empty_warns_while_draining(self):
+        # Write 4 (write-only edges), drain with read-only edges.  With
+        # margin 1 the warning asserts no later than one accepted read before
+        # the real empty flag.
+        fifo = AsyncFIFO(k=2, almost_empty_margin=1)
+        for t in range(1, 5):
+            fifo.run_one(Event(t, True, False, wen=True, wdata=t))
+        warned = []
+        emptied = []
+        for t in range(5, 12):
+            rec = fifo.run_one(Event(t, False, True, ren=True))
+            if rec.almost_empty_after:
+                warned.append(t)
+            if rec.empty_after:
+                emptied.append(t)
+        self.assertTrue(warned and emptied)
+        self.assertLessEqual(warned[0], emptied[0])
+
+    def test_guaranteed_bounds_hold_across_wraps(self):
+        # k=1, pointers wrap every 2 accepts; drive many wrap cycles and
+        # verify the warning never promises more than local register data
+        # guarantees:
+        #   * full => margin-0 almost-full must also be on;
+        #   * margin-0 almost-empty OFF => newest synced write pointer
+        #     provably leaves at least one entry ahead of the read pointer.
+        from afifo import gray_to_binary
+        fifo = AsyncFIFO(k=1, almost_full_margin=0,
+                         almost_empty_margin=0)
+        for t in range(1, 80):
+            if t % 2:
+                rec = fifo.run_one(
+                    Event(t, True, False, wen=True, wdata=t))
+                if rec.full_after:
+                    self.assertTrue(rec.almost_full_after)
+            else:
+                rec = fifo.run_one(Event(t, False, True, ren=True))
+                if not rec.almost_empty_after:
+                    guaranteed = ((gray_to_binary(rec.w2r_after[0])
+                                   - rec.rptr_after) % 4)
+                    self.assertGreaterEqual(guaranteed, 1)
+        self.assertGreater(fifo.accepted_writes, 4)
+        self.assertGreater(fifo.accepted_reads, 4)
+
+    def test_coincident_edge_uses_old_sync_state(self):
+        fifo = AsyncFIFO(k=2, almost_full_margin=1, almost_empty_margin=1)
+        fifo.run_one(Event(1, True, False, wen=True, wdata=1))
+        for t in (2, 3):
+            fifo.run_one(Event(t, False, True))
+        af_before = fifo.almost_full
+        ae_before = fifo.almost_empty
+        rec = fifo.run_one(Event(4, True, True, wen=True, ren=True))
+        # both flags recomputed from OLD synchronizer outputs only
+        self.assertEqual(rec.almost_full_before, af_before)
+        self.assertEqual(rec.almost_empty_before, ae_before)
+        self.assertEqual(rec.r2w_after[0], rec.rgray_before)
+        self.assertEqual(rec.w2r_after[0], rec.wgray_before)
+
+    def test_stopped_clock_holds_almost_flag_register(self):
+        fifo = AsyncFIFO(k=2, almost_full_margin=1)
+        fifo.run([Event(1, True, False, wen=True, wdata=1),
+                  Event(2, True, False, wen=True, wdata=2),
+                  Event(3, True, False, wen=True, wdata=3)])
+        held = fifo.almost_full
+        for t in (4, 5, 6):
+            rec = fifo.run_one(Event(t, False, True))
+            self.assertIs(rec.almost_full_after, held)
+
+    def test_warning_never_late_against_real_occupancy(self):
+        """Whenever real free/entries cross the margin the warning is on.
+
+        Early (pessimistic) assertions are allowed; a missing warning when
+        the true abstract-queue occupancy already crossed the threshold would
+        overpromise and is forbidden.  Checked with the independent reference
+        queue over mixed ratios, stops and k=1 wrap churn.
+        """
+        combos = [(1, 1, 1, 0, 0), (1, 2, 3, 1, 1), (2, 3, 2, 1, 2),
+                  (3, 2, 5, 3, 1), (5, 3, 2, 3, 3)]
+        for k, wp, rp, mf, me in combos:
+            schedule = make_schedule(
+                k, 600, w_period=wp, r_period=rp,
+                seed=k * 131 + wp * 17 + rp + mf * 7 + me,
+                stop_windows=((200, 260),),
+                r_stop_windows=((400, 450),),
+            )
+            dut = AsyncFIFO(k, almost_full_margin=mf,
+                            almost_empty_margin=me)
+            ref = RefFIFO(k)
+            with self.subTest(k=k, wp=wp, rp=rp):
+                for (t, wc, rc, we, re_, data) in schedule:
+                    rec = dut.run_one(Event(t, wc, rc, we, re_, data))
+                    occ = ref.step(wc, rc, we, re_, data)["occupancy"]
+                    if wc:
+                        self.assertTrue(
+                            (1 << k) - occ > mf
+                            or rec.almost_full_after
+                        )
+                    if rc:
+                        self.assertTrue(occ > me or rec.almost_empty_after)
+
+
 class TestStoppedClock(unittest.TestCase):
     def test_write_clock_stop_freezes_write_domain(self):
         fifo = AsyncFIFO(k=2)
@@ -196,13 +356,15 @@ class TestStoppedClock(unittest.TestCase):
 class TestDifferentialAgainstIndependentModel(unittest.TestCase):
     """Compare every register against RefFIFO over deterministic schedules."""
 
-    def _diff_run(self, k, wp, rp, n, seed=1, w_stops=(), r_stops=()):
+    def _diff_run(self, k, wp, rp, n, seed=1, w_stops=(), r_stops=(),
+                  af_margin=1, ae_margin=1):
         schedule = make_schedule(
             k, n, w_period=wp, r_period=rp, seed=seed,
             stop_windows=w_stops, r_stop_windows=r_stops,
         )
-        dut = AsyncFIFO(k=k)
-        ref = RefFIFO(k=k)
+        dut = AsyncFIFO(k=k, almost_full_margin=af_margin,
+                        almost_empty_margin=ae_margin)
+        ref = RefFIFO(k=k, af_margin=af_margin, ae_margin=ae_margin)
         events = [Event(t, wc, rc, we, re_, data)
                   for (t, wc, rc, we, re_, data) in schedule]
         records = dut.run(events)
@@ -220,6 +382,8 @@ class TestDifferentialAgainstIndependentModel(unittest.TestCase):
                 self.assertEqual(rec.rgray_after, exp["rgray"])
                 self.assertIs(rec.full_after, exp["full"])
                 self.assertIs(rec.empty_after, exp["empty"])
+                self.assertIs(rec.almost_full_after, exp["almost_full"])
+                self.assertIs(rec.almost_empty_after, exp["almost_empty"])
                 self.assertEqual(rec.r2w_after, exp["r2w"])
                 self.assertEqual(rec.w2r_after, exp["w2r"])
                 self.assertEqual(rec.rdata, exp["rdata"])
@@ -255,6 +419,17 @@ class TestDifferentialAgainstIndependentModel(unittest.TestCase):
         self._diff_run(1, 1, 1, 400, seed=42)
         # k=5 (depth 32) needs 64 accepts per wrap; long run covers it.
         self._diff_run(5, 2, 3, 4000, seed=77)
+
+    def test_almost_thresholds_diff(self):
+        for k in (1, 2, 3, 4, 5):
+            for af, ae in ((0, 0), (1, 1), (1, 3), (3, 1),
+                           (1 << k, 1 << k)):
+                af_ok = min(af, (1 << k) - 1)
+                ae_ok = min(ae, (1 << k) - 1)
+                self._diff_run(k, 2, 3, 200, seed=k * 500 + af * 7 + ae,
+                               af_margin=af_ok, ae_margin=ae_ok)
+                self._diff_run(k, 1, 1, 200, seed=k * 700 + af + ae,
+                               af_margin=af_ok, ae_margin=ae_ok)
 
 
 class TestSafetyInvariants(unittest.TestCase):

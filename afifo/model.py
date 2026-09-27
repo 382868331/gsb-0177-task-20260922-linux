@@ -22,6 +22,14 @@ Timing model (one :class:`Event` = one point on an integer time axis)
   accepted iff ``rclk and ren and not empty_old``.  Acceptance never consults
   a global queue length -- the data array is addressed memory, not a flag.
 
+User-programmable warning registers ``almost_full`` (write domain) and
+``almost_empty`` (read domain) fire when the free space / stored entries
+*guaranteed* by the local next pointer and the OLD synchronizer contents
+drop to the configured margins.  Almost-full uses the oldest synced read
+pointer (``r2w_s2``, occupancy upper bound); almost-empty uses the newest
+synced write pointer (``w2r_s1``, occupancy lower bound).  They never affect
+acceptance, full/empty, the synchronizers, or the data path.
+
 Disabling a clock (``wclk=False`` / ``rclk=False``) freezes every register in
 that domain, synchronizers included.
 """
@@ -29,7 +37,7 @@ that domain, synchronizers included.
 import math
 from typing import Any, NamedTuple, Optional
 
-from .gray import binary_to_gray
+from .gray import binary_to_gray, gray_to_binary
 
 __all__ = ["AsyncFIFO", "AsyncFIFOError", "Event", "EdgeRecord"]
 
@@ -164,6 +172,10 @@ class EdgeRecord(NamedTuple):
     full_after: bool
     empty_before: bool
     empty_after: bool
+    almost_full_before: bool
+    almost_full_after: bool
+    almost_empty_before: bool
+    almost_empty_after: bool
     r2w_before: tuple
     w2r_before: tuple
     r2w_after: tuple
@@ -177,15 +189,40 @@ class AsyncFIFO:
 
     Parameters
         k: log2 depth; ``k in {1, 2, 3, 4, 5}`` (depth 2..32).
+        almost_full_margin: write-side warning margin in free entries,
+               ``0 <= m <= depth`` (``bool`` rejected).  The write-domain
+               ``almost_full`` register asserts whenever the *guaranteed*
+               number of free entries is ``<= m`` under the worst pointer
+               lag still possible through the two-stage synchronizer.  ``0``
+               reduces the warning to the exact (conservative) full case;
+               ``depth`` warns permanently.
+        almost_empty_margin: read-side warning margin in stored entries,
+               ``0 <= m <= depth``.  The read-domain ``almost_empty``
+               register asserts whenever the guaranteed number of stored
+               entries is ``<= m``.  ``0`` reduces it to the conservative
+               empty case; ``depth`` warns permanently.
 
     Usage
         >>> fifo = AsyncFIFO(k=3)
         >>> records = fifo.run([Event(0, True, False, wen=True, wdata=10)])
     """
 
-    def __init__(self, k: int) -> None:
+    def __init__(
+        self,
+        k: int,
+        almost_full_margin: int = 1,
+        almost_empty_margin: int = 1,
+    ) -> None:
         self._k = _strict_int(k, "k", lo=1, hi=5)
         self._depth = 1 << k
+        self._afull_margin = _strict_int(
+            almost_full_margin, "almost_full_margin",
+            lo=0, hi=self._depth,
+        )
+        self._aempty_margin = _strict_int(
+            almost_empty_margin, "almost_empty_margin",
+            lo=0, hi=self._depth,
+        )
         self._width = k + 1
         self._mask = (1 << (k + 1)) - 1
         self._addr_mask = self._depth - 1
@@ -199,6 +236,13 @@ class AsyncFIFO:
         self._rptr = 0
         self._full = False
         self._empty = True
+        # Almost-full is a write-domain register, almost-empty a read-domain
+        # register.  At reset every pointer/synchronizer value is 0: the read
+        # side can guarantee zero stored entries (almost_empty necessarily
+        # on), while the write side sees the whole depth free; almost_full is
+        # on only when the user margin covers the whole depth.
+        self._almost_full = self._afull_margin >= self._depth
+        self._almost_empty = True
         self._r2w_s1 = 0  # synchronized read Gray, stage 1 (write domain)
         self._r2w_s2 = 0  # synchronized read Gray, stage 2 (write domain)
         self._w2r_s1 = 0  # synchronized write Gray, stage 1 (read domain)
@@ -227,6 +271,34 @@ class AsyncFIFO:
     def empty(self) -> bool:
         """Current read-domain empty flag (register output)."""
         return self._empty
+
+    @property
+    def almost_full(self) -> bool:
+        """Write-domain almost-full warning (register output).
+
+        Asserted when the free space that can be *guaranteed* from the local
+        write pointer and the stale synchronized read pointer is no greater
+        than ``almost_full_margin``.
+        """
+        return self._almost_full
+
+    @property
+    def almost_empty(self) -> bool:
+        """Read-domain almost-empty warning (register output).
+
+        Asserted when the number of stored entries that can be *guaranteed*
+        from the local read pointer and the stale synchronized write pointer
+        is no greater than ``almost_empty_margin``.
+        """
+        return self._almost_empty
+
+    @property
+    def almost_full_margin(self) -> int:
+        return self._afull_margin
+
+    @property
+    def almost_empty_margin(self) -> int:
+        return self._aempty_margin
 
     @property
     def wptr(self) -> int:
@@ -258,6 +330,8 @@ class AsyncFIFO:
             "rgray": binary_to_gray(self._rptr),
             "full": self._full,
             "empty": self._empty,
+            "almost_full": self._almost_full,
+            "almost_empty": self._almost_empty,
             "r2w": (self._r2w_s1, self._r2w_s2),
             "w2r": (self._w2r_s1, self._w2r_s2),
             "last_time": self._last_time,
@@ -320,6 +394,7 @@ class AsyncFIFO:
         # ---- old state, sampled by both edges at this (possibly common) time
         wptr_o, rptr_o = self._wptr, self._rptr
         full_o, empty_o = self._full, self._empty
+        afull_o, aempty_o = self._almost_full, self._almost_empty
         r2w_s1_o, r2w_s2_o = self._r2w_s1, self._r2w_s2
         w2r_s1_o, w2r_s2_o = self._w2r_s1, self._w2r_s2
         wgray_o = binary_to_gray(wptr_o)
@@ -351,6 +426,40 @@ class AsyncFIFO:
         if event.rclk:
             empty_n = rgray_n == w2r_s2_o
 
+        # ---- almost-full / almost-empty: conservative occupancy bounds.
+        #
+        # The two synchronizer stages may hold two different legal Gray
+        # values simultaneously.  The stage-1 value is one edge newer than
+        # stage-2, but neither can be trusted as "current": the opposite
+        # pointer may already have advanced one more step by this edge.  So
+        # the warning uses the *least favorable* stage still in flight:
+        #
+        #   write side: smallest synced read ptr  -> largest possible fill
+        #   read  side: largest  synced write ptr -> smallest possible fill
+        #
+        # Like full/empty, the local next pointer after a possible accepted
+        # access and the OLD synchronizer outputs are used, so a coincident
+        # read+write edge leaves both domains sampling pre-edge state.
+        afull_n = afull_o
+        if event.wclk:
+            # r2w_s2 is the OLDEST confirmed read pointer still in the
+            # synchronizer, hence the earliest position reads could be
+            # guaranteed to have reached; it bounds fill from above.
+            occ_max = (wptr_n - gray_to_binary(r2w_s2_o)) & (
+                2 * self._depth - 1
+            )
+            free_guaranteed = self._depth - min(occ_max, self._depth)
+            afull_n = free_guaranteed <= self._afull_margin
+        aempty_n = aempty_o
+        if event.rclk:
+            # w2r_s1 is the NEWEST confirmed write pointer; entries up to it
+            # are guaranteed to exist and bound the fill from below.
+            occ_min = (gray_to_binary(w2r_s1_o) - rptr_n) & (
+                2 * self._depth - 1
+            )
+            entries_guaranteed = min(occ_min, self._depth)
+            aempty_n = entries_guaranteed <= self._aempty_margin
+
         # ---- two-stage synchronizers; input stage samples the OLD Gray
         if event.wclk:
             r2w_s1_n, r2w_s2_n = rgray_o, r2w_s1_o
@@ -364,6 +473,8 @@ class AsyncFIFO:
         # ---- commit
         self._wptr, self._rptr = wptr_n, rptr_n
         self._full, self._empty = full_n, empty_n
+        self._almost_full = afull_n
+        self._almost_empty = aempty_n
         self._r2w_s1, self._r2w_s2 = r2w_s1_n, r2w_s2_n
         self._w2r_s1, self._w2r_s2 = w2r_s1_n, w2r_s2_n
         self._last_time = event.time
@@ -388,6 +499,10 @@ class AsyncFIFO:
             full_after=full_n,
             empty_before=empty_o,
             empty_after=empty_n,
+            almost_full_before=afull_o,
+            almost_full_after=afull_n,
+            almost_empty_before=aempty_o,
+            almost_empty_after=aempty_n,
             r2w_before=(r2w_s1_o, r2w_s2_o),
             w2r_before=(w2r_s1_o, w2r_s2_o),
             r2w_after=(r2w_s1_n, r2w_s2_n),

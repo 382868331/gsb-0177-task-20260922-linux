@@ -15,15 +15,26 @@ def ref_gray(binary: int) -> int:
     return binary ^ (binary >> 1)
 
 
+def ref_ungray(gray: int) -> int:
+    """Independently re-stated Gray decoder."""
+    bits = gray
+    while bits:
+        bits >>= 1
+        gray ^= bits
+    return gray
+
+
 class RefFIFO:
     """Hand-written reference mirroring the contracted hardware semantics."""
 
-    def __init__(self, k: int) -> None:
+    def __init__(self, k: int, af_margin=1, ae_margin=1) -> None:
         assert 1 <= k <= 5
         self.k = k
         self.depth = 1 << k
         self.mask = (1 << (k + 1)) - 1
         self.full_mask = 0b11 << (k - 1)
+        self.af_margin = af_margin
+        self.ae_margin = ae_margin
         # monotonic accepted-access counters (wrap-free occupancy measure)
         self.n_w = 0
         self.n_r = 0
@@ -34,6 +45,8 @@ class RefFIFO:
         self.rptr = 0
         self.full = False
         self.empty = True
+        self.almost_full = self.af_margin >= self.depth
+        self.almost_empty = True
         self.r2w = [0, 0]  # synchronized read Gray, stages 1/2, write domain
         self.w2r = [0, 0]  # synchronized write Gray, stages 1/2, read domain
         self.queue = deque()  # abstract data queue (ordering oracle only)
@@ -64,9 +77,18 @@ class RefFIFO:
         if wclk:
             self.full = ref_gray(w_n) == (r2w_2_o ^ self.full_mask)
             self.r2w = [ref_gray(r_o), r2w_1_o]  # samples OLD read Gray
+            # Oldest confirmed read pointer (s2) -> worst-case fill.
+            occ_hi = (w_n - ref_ungray(r2w_2_o)) % (2 * self.depth)
+            free_sure = self.depth - min(occ_hi, self.depth)
+            self.almost_full = free_sure <= self.af_margin
         if rclk:
             self.empty = ref_gray(r_n) == w2r_2_o
             self.w2r = [ref_gray(w_o), w2r_1_o]  # samples OLD write Gray
+            # Newly latched (newest confirmed) write pointer s1 -> entries
+            # guaranteed present for the local next read pointer r_n.
+            occ_lo = (ref_ungray(w2r_1_o) - r_n) % (2 * self.depth)
+            entries_sure = min(occ_lo, self.depth)
+            self.almost_empty = entries_sure <= self.ae_margin
 
         self.wptr, self.rptr = w_n, r_n
         return {
@@ -78,6 +100,8 @@ class RefFIFO:
             "rgray": ref_gray(r_n),
             "full": self.full,
             "empty": self.empty,
+            "almost_full": self.almost_full,
+            "almost_empty": self.almost_empty,
             "r2w": tuple(self.r2w),
             "w2r": tuple(self.w2r),
             "occupancy": len(self.queue),
